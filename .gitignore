@@ -25,9 +25,11 @@ htmlcov/
 *.pem
 *.key
 
-# Downloaded media & local models
+# Downloaded media, local models, & generated transcripts
 downloads/
 models/
+transcripts/
+*.transcript.json
 
 # Temporary / media files (prevent accidental commits)
 *.mp4

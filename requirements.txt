@@ -1,1 +1,6 @@
 yt-dlp>=2026.10.0
+faster-whisper>=1.2.0
+
+# Optional NVIDIA GPU (CUDA 12 + cuDNN 9) runtime packages for Windows FP16 acceleration:
+# nvidia-cublas-cu12>=12.0.0
+# nvidia-cudnn-cu12>=9.0.0

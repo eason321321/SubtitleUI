@@ -1,12 +1,29 @@
-"""Minimal CLI entry point for SubtitleUI Phase 1 media downloading."""
+"""CLI entry point for SubtitleUI (Phase 1 media downloader + Phase 2 local ASR)."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
-from typing import Sequence, TextIO
+from typing import Callable, Sequence, TextIO
 
+from .asr import (
+    ASRError,
+    CancellationToken,
+    DEFAULT_LANGUAGE,
+    DEFAULT_MODEL_NAME,
+    DEFAULT_MODELS_DIR,
+    DEFAULT_TASK,
+    ModelConfig,
+    SUPPORTED_DEVICES,
+    SUPPORTED_MODELS,
+    TranscriptionCancelledError,
+    TranscriptionEngine,
+    TranscriptionProgress,
+    TranscriptionRequest,
+    TranscriptionStage,
+    format_timestamp,
+)
 from .downloader import (
     DownloaderError,
     DownloadInterruptedError,
@@ -17,6 +34,8 @@ from .downloader import (
     ExistingFilePolicy,
     MediaDownloader,
 )
+
+EngineFactory = Callable[[ModelConfig], TranscriptionEngine]
 
 
 def format_bytes(num_bytes: int | float | None) -> str:
@@ -44,7 +63,7 @@ def format_eta(seconds: int | float | None) -> str:
 
 
 class ConsoleProgressReporter:
-    """Renders download progress snapshots to a text stream."""
+    """Renders Phase 1 download progress snapshots to a text stream."""
 
     def __init__(self, stream: TextIO | None = None) -> None:
         self._stream = stream or sys.stdout
@@ -92,11 +111,46 @@ class ConsoleProgressReporter:
             self._stream.flush()
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the CLI argument parser."""
+class ConsoleASRProgressReporter:
+    """Renders Phase 2 ASR workflow stages and elapsed time to a text stream."""
+
+    def __init__(self, stream: TextIO | None = None) -> None:
+        self._stream = stream or sys.stdout
+
+    def __call__(self, progress: TranscriptionProgress) -> None:
+        stage_labels = {
+            TranscriptionStage.VALIDATING: "[檢查中]",
+            TranscriptionStage.EXTRACTING_AUDIO: "[擷取音訊]",
+            TranscriptionStage.LOADING_MODEL: "[載入模型]",
+            TranscriptionStage.TRANSCRIBING: "[辨識中]",
+            TranscriptionStage.SAVING: "[儲存中]",
+            TranscriptionStage.COMPLETED: "[完成]",
+            TranscriptionStage.CANCELLED: "[已取消]",
+            TranscriptionStage.ERROR: "[錯誤]",
+        }
+        label = stage_labels.get(progress.stage, "[狀態]")
+        elapsed = f"{progress.elapsed_seconds:.1f}s"
+        hw_info = (
+            f" | {progress.device.upper()}/{progress.compute_type}"
+            if progress.device and progress.compute_type
+            else ""
+        )
+        self._stream.write(
+            f"{label} [模型: {progress.model_name}{hw_info} | 耗時: {elapsed}] {progress.message}\n"
+        )
+        self._stream.flush()
+
+
+def build_download_parser(*, prog: str = "subtitleui") -> argparse.ArgumentParser:
+    """Build the Phase 1 download CLI argument parser."""
     parser = argparse.ArgumentParser(
-        prog="subtitleui",
-        description="SubtitleUI (Phase 1) - 輕量化本機影片／音訊下載工具",
+        prog=prog,
+        description=(
+            "SubtitleUI - 輕量化本機韓文影片下載與語音辨識工具\n"
+            "  下載模式（預設）：subtitleui <url> [options] 或 subtitleui download <url> [options]\n"
+            "  辨識模式（Phase 2）：subtitleui transcribe <audio_or_video> [options]"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "url",
@@ -130,7 +184,86 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _prompt_interactive(
+def build_transcribe_parser() -> argparse.ArgumentParser:
+    """Build the Phase 2 local ASR transcription CLI argument parser."""
+    models_hint = ", ".join(SUPPORTED_MODELS)
+    parser = argparse.ArgumentParser(
+        prog="subtitleui transcribe",
+        description="SubtitleUI (Phase 2) - 本機 Faster-Whisper 韓文語音辨識（支援整部影片與自訂時間範圍）",
+    )
+    parser.add_argument(
+        "input_path",
+        nargs="?",
+        help="本機音訊或影片檔案路徑（若未提供，將以互動方式提示輸入）",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=f"Whisper 模型名稱或本機模型資料夾（常用：{models_hint}），預設為 {DEFAULT_MODEL_NAME}",
+    )
+    parser.add_argument(
+        "--language",
+        default=DEFAULT_LANGUAGE,
+        help=f"辨識語言代碼，預設為 {DEFAULT_LANGUAGE}",
+    )
+    parser.add_argument(
+        "--task",
+        choices=["transcribe", "translate"],
+        default=DEFAULT_TASK,
+        help=f"辨識任務：transcribe（轉錄原文）或 translate，預設為 {DEFAULT_TASK}",
+    )
+    parser.add_argument(
+        "--start",
+        default=None,
+        help="自訂辨識開始時間（例如 00:12:30 或秒數 750）；未指定則從 00:00:00 開始",
+    )
+    parser.add_argument(
+        "--end",
+        default=None,
+        help="自訂辨識結束時間（例如 00:18:00 或秒數 1080）；未指定則辨識至影片結尾",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="輸出 JSON 逐字稿路徑（預設為輸入檔案同資料夾之 <檔名>.transcript.json）",
+    )
+    parser.add_argument(
+        "--device",
+        choices=list(SUPPORTED_DEVICES),
+        default="auto",
+        help="運算裝置：auto（優先 CUDA+FP16，失敗自動切換 CPU+INT8）、cuda 或 cpu，預設為 auto",
+    )
+    parser.add_argument(
+        "--compute-type",
+        default=None,
+        help="自訂 CTranslate2 計算精度（如 float16、int8）；預設依裝置自動選擇",
+    )
+    parser.add_argument(
+        "--model-dir",
+        default=str(DEFAULT_MODELS_DIR),
+        help=f"本機模型快取資料夾路徑，預設為 {DEFAULT_MODELS_DIR}",
+    )
+    parser.add_argument(
+        "--beam-size",
+        type=int,
+        default=5,
+        help="Beam search 寬度，預設為 5",
+    )
+    parser.add_argument(
+        "--vad-filter",
+        action="store_true",
+        help="啟用 Silero VAD 過濾靜音片段（預設關閉）",
+    )
+    return parser
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Backwards-compatible alias for the default Phase 1 download parser."""
+    return build_download_parser()
+
+
+def _prompt_interactive_download(
     args: argparse.Namespace,
     input_func=input,
     output_stream: TextIO | None = None,
@@ -173,22 +306,83 @@ def _prompt_interactive(
     return url, mode, Path(output_str)
 
 
-def main(
-    argv: Sequence[str] | None = None,
-    *,
-    downloader: MediaDownloader | None = None,
+def _default_transcript_output_path(input_path: Path) -> Path:
+    return input_path.expanduser().resolve().with_suffix(".transcript.json")
+
+
+def _prompt_interactive_transcribe(
+    args: argparse.Namespace,
     input_func=input,
-    stdout: TextIO | None = None,
-    stderr: TextIO | None = None,
+    output_stream: TextIO | None = None,
+) -> tuple[Path, str, str | None, str | None, Path]:
+    stream = output_stream or sys.stdout
+
+    raw_input = args.input_path
+    interactive = not raw_input
+    if not raw_input:
+        stream.write("請輸入音訊或影片檔案路徑: ")
+        stream.flush()
+        raw_input = input_func().strip().strip('"').strip("'")
+
+    input_path = Path(raw_input)
+
+    model_name = args.model
+    if not model_name:
+        if not interactive:
+            model_name = DEFAULT_MODEL_NAME
+        else:
+            models_list = "/".join(SUPPORTED_MODELS)
+            stream.write(f"請選擇 Whisper 模型 [{models_list}] (預設 {DEFAULT_MODEL_NAME}): ")
+            stream.flush()
+            entered_model = input_func().strip()
+            model_name = entered_model or DEFAULT_MODEL_NAME
+
+    start_time = args.start
+    end_time = args.end
+    if interactive and start_time is None and end_time is None:
+        stream.write("請選擇辨識範圍 [1: 整部影片 / 2: 自訂時間範圍] (預設 1): ")
+        stream.flush()
+        choice = input_func().strip()
+        if choice == "2":
+            stream.write("請輸入開始時間 (格式 HH:MM:SS，例如 00:12:30): ")
+            stream.flush()
+            entered_start = input_func().strip()
+            start_time = entered_start or None
+
+            stream.write("請輸入結束時間 (格式 HH:MM:SS，例如 00:18:00): ")
+            stream.flush()
+            entered_end = input_func().strip()
+            end_time = entered_end or None
+
+    output_str = args.output
+    default_out = _default_transcript_output_path(input_path)
+    if output_str is None:
+        if not interactive:
+            output_path = default_out
+        else:
+            stream.write(f"請輸入輸出 JSON 路徑 (預設 {default_out}): ")
+            stream.flush()
+            entered_output = input_func().strip().strip('"').strip("'")
+            output_path = Path(entered_output) if entered_output else default_out
+    else:
+        output_path = Path(output_str)
+
+    return input_path, model_name, start_time, end_time, output_path
+
+
+def _run_download(
+    argv: list[str],
+    *,
+    downloader: MediaDownloader | None,
+    input_func,
+    out: TextIO,
+    err: TextIO,
 ) -> int:
-    """Run the Phase 1 CLI and return an exit status code."""
-    out = stdout or sys.stdout
-    err = stderr or sys.stderr
-    parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    parser = build_download_parser()
+    args = parser.parse_args(argv)
 
     try:
-        url, mode, output_dir = _prompt_interactive(
+        url, mode, output_dir = _prompt_interactive_download(
             args, input_func=input_func, output_stream=out
         )
         policy = ExistingFilePolicy(args.on_exists)
@@ -222,3 +416,135 @@ def main(
     out.write(f"檔案：{result.file_path}\n")
     out.write(f"大小：{format_bytes(result.file_size)}\n")
     return 0
+
+
+def _run_transcribe(
+    argv: list[str],
+    *,
+    engine_factory: EngineFactory | None,
+    cancel_token: CancellationToken | None,
+    input_func,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    parser = build_transcribe_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        input_path, model_name, start_time, end_time, output_path = (
+            _prompt_interactive_transcribe(
+                args, input_func=input_func, output_stream=out
+            )
+        )
+        model_config = ModelConfig(
+            model_name=model_name,
+            device=args.device,
+            compute_type=args.compute_type,
+            download_root=Path(args.model_dir),
+        )
+        engine = (
+            engine_factory(model_config)
+            if engine_factory is not None
+            else TranscriptionEngine(model_config)
+        )
+        request = TranscriptionRequest(
+            audio_path=input_path,
+            language=args.language,
+            task=args.task,
+            start_time=start_time,
+            end_time=end_time,
+            output_path=output_path,
+            beam_size=args.beam_size,
+            vad_filter=args.vad_filter,
+        )
+        reporter = ConsoleASRProgressReporter(stream=out)
+        result = engine.transcribe(
+            request,
+            progress_callback=reporter,
+            cancel_token=cancel_token,
+        )
+    except TranscriptionCancelledError as exc:
+        err.write(f"辨識已取消：{exc}\n")
+        return 130
+    except KeyboardInterrupt:
+        err.write("\n已取消辨識操作。\n")
+        return 130
+    except ASRError as exc:
+        err.write(f"辨識失敗：{exc}\n")
+        return 1
+    except Exception as exc:
+        err.write(f"發生未預期的錯誤：{exc}\n")
+        return 1
+
+    meta = result.metadata
+    out.write("\n辨識摘要：\n")
+    out.write(f"來源：{meta.source}\n")
+    out.write(f"模型：{meta.model}（{meta.device.upper()} / {meta.compute_type}）\n")
+    out.write(f"語言：{meta.language}（任務：{meta.task}）\n")
+    if meta.language_probability is not None:
+        out.write(f"語言信心度：{meta.language_probability:.4f}\n")
+    out.write(
+        f"辨識區間：{format_timestamp(meta.range_start)} ~ {format_timestamp(meta.range_end)}"
+        f"（原片長度：{format_timestamp(meta.source_duration)}）\n"
+    )
+    out.write(f"片段數量：{len(result.segments)}\n")
+    if meta.elapsed_seconds is not None:
+        out.write(f"總耗時：{meta.elapsed_seconds:.2f} 秒\n")
+    if result.output_path is not None:
+        out.write(f"JSON 輸出：{result.output_path}\n")
+
+    if result.segments:
+        preview_count = min(5, len(result.segments))
+        out.write(f"\n前 {preview_count} 段預覽（原影片時間戳記）：\n")
+        for seg in result.segments[:preview_count]:
+            out.write(
+                f"  [{format_timestamp(seg.start, include_millis=True)} -> "
+                f"{format_timestamp(seg.end, include_millis=True)}] {seg.text}\n"
+            )
+    else:
+        out.write("\n（此時間範圍內未辨識出有效語音片段。）\n")
+
+    return 0
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    downloader: MediaDownloader | None = None,
+    engine_factory: EngineFactory | None = None,
+    cancel_token: CancellationToken | None = None,
+    input_func=input,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> int:
+    """Run the SubtitleUI CLI (download or transcribe) and return an exit status code."""
+    out = stdout or sys.stdout
+    err = stderr or sys.stderr
+    raw_args = list(argv) if argv is not None else list(sys.argv[1:])
+
+    if raw_args and raw_args[0] == "transcribe":
+        return _run_transcribe(
+            raw_args[1:],
+            engine_factory=engine_factory,
+            cancel_token=cancel_token,
+            input_func=input_func,
+            out=out,
+            err=err,
+        )
+
+    if raw_args and raw_args[0] == "download":
+        return _run_download(
+            raw_args[1:],
+            downloader=downloader,
+            input_func=input_func,
+            out=out,
+            err=err,
+        )
+
+    return _run_download(
+        raw_args,
+        downloader=downloader,
+        input_func=input_func,
+        out=out,
+        err=err,
+    )

@@ -51,7 +51,8 @@
 | **yt-dlp** | Phase 1 | 解析網路影片網址並串流下載影片或音訊至本機 |
 | **FFmpeg** | Phase 1 / 2 | 影音串流合併（Phase 1）與音訊擷取／格式轉換（Phase 1、2） |
 | **pytest**（開發測試） | Phase 1 | 單元測試與 Mock 測試執行（亦相容標準庫 `unittest`） |
-| **Faster-Whisper** | Phase 2 | 基於 CTranslate2 的高效本機 Whisper 語音辨識引擎 |
+| **Faster-Whisper / CTranslate2** | Phase 2 | 基於 CTranslate2 的高效本機 Whisper 語音辨識引擎（支援 CUDA FP16 / CPU INT8） |
+| **nvidia-cublas-cu12 / nvidia-cudnn-cu12**（選用） | Phase 2 | Windows NVIDIA GPU 加速所需之 CUDA 12 / cuDNN 9 執行期函式庫（未安裝時自動降級 CPU INT8） |
 | **PySide6** | Phase 4 | 跨平台桌面 GUI 框架（Qt for Python） |
 
 > 註：專案遵循最小依賴原則，每個階段僅安裝該階段實際需要的套件。
@@ -78,18 +79,21 @@
   - 具備完整自動化測試（以 Mock 為主，涵蓋主要正常與異常情境）。
 
 ### Phase 2：本機語音辨識
-- **目標**：將下載的音訊轉換成帶有時間戳記的韓文逐字稿。
-- **核心技術**：Faster-Whisper、Whisper 模型、FFmpeg。
+- **目標**：將本機影片或音訊轉換成帶有原始影片時間戳記的韓文逐字稿，並支援整部影片與自訂時間範圍辨識。
+- **核心技術**：Faster-Whisper、CTranslate2、Whisper 模型、FFmpeg / FFprobe、JSON。
 - **核心功能**：
-  1. 載入本機 ASR 模型。
-  2. 支援韓文（`ko`）語音辨識。
-  3. 支援選擇不同模型大小（初期優先評估 `small`、`medium` 與 `large-v3-turbo` 的效能與辨識品質）。
-  4. 產生帶有時間戳記（segment / word 級別）的辨識結果。
-  5. 儲存原始辨識結果供後續處理與重用。
+  1. 載入並快取本機 Faster-Whisper 模型（`TranscriptionEngine` 可重複使用，不重複初始化）。
+  2. 支援韓文（`ko`）語音辨識，預設任務為 `transcribe`，保留模型原始輸出不自動翻譯或改寫。
+  3. 支援依設定／CLI 參數切換模型（`small`、`medium`、`large-v3`、`large-v3-turbo`，初期預設 `medium`）。
+  4. 支援整部影片（模式 A）與自訂時間範圍（模式 B，`HH:MM:SS` 驗證與 FFmpeg 精確擷取 16 kHz 單聲道 PCM WAV，不使用 stream copy）。
+  5. 自動執行時間戳記偏移校正（`original_timestamp = segment_timestamp + selected_start_time`），確保輸出對齊原影片時間軸。
+  6. 硬體策略自動切換：優先 `CUDA + FP16`，GPU 或執行期函式庫不可用／初始化失敗時自動備援 `CPU + INT8`。
+  7. 儲存原始辨識結果為統一 UTF-8 JSON 格式（含中繼資料與模型回報之語言信心資訊），並支援工作階段回報與取消機制（`CancellationToken`）。
 - **完成標準**：
   - 能在本機載入指定 Whisper 模型並完成韓文音訊轉錄。
-  - 能輸出具時間戳記的結構化原始辨識結果檔案。
-  - 能處理缺少模型、音訊格式不支援或裝置資源不足等錯誤。
+  - 能指定原影片開始與結束時間，僅對擷取區間進行辨識並輸出正確偏移後的原影片時間戳記。
+  - 能輸出具時間戳記的結構化原始辨識結果 JSON 檔案。
+  - 能妥善處理缺少模型、無效時間範圍、音訊不存在、空音訊、取消操作與 GPU 不可用備援。
 
 ### Phase 3：逐字稿處理與匯出
 - **目標**：將原始 ASR 結果整理為易於閱讀、編輯與外掛使用的逐字稿格式。
@@ -110,12 +114,14 @@
 - **核心功能**：
   1. 影片網址輸入與下載模式選擇。
   2. 下載進度與狀態顯示（非同步執行，不阻塞介面）。
-  3. ASR 模型選擇。
-  4. 語音辨識進度顯示。
-  5. 逐字稿瀏覽區顯示。
-  6. 一鍵匯出功能（SRT / TXT / JSON）。
+  3. 非同步取消下載機制（Cancellation Token）：擴充 `downloader` 模組，於 `progress_hook` 加入可外部觸發的取消旗標（如 `threading.Event` / Cancellation Token），在觸發取消時安全中止 `yt-dlp` 下載並拋出 `DownloadInterruptedError`，支援 GUI「取消下載」按鈕。
+  4. ASR 模型選擇。
+  5. 語音辨識進度顯示。
+  6. 逐字稿瀏覽區顯示。
+  7. 一鍵匯出功能（SRT / TXT / JSON）。
 - **完成標準**：
   - GUI 可直接呼叫既有核心模組完成「下載 → 辨識 → 瀏覽 → 匯出」完整流程，且操作過程介面流暢不卡死。
+  - 使用者點擊「取消下載」按鈕時，能透過 Cancellation Token 安全中止背景下載任務並回復介面狀態，不造成程式崩潰。
 
 ### Phase 5：影片與逐字稿同步
 - **目標**：建立真正可用的韓文聽力學習播放介面。
@@ -145,7 +151,7 @@
 
 ## 6. 專案目錄規劃
 
-採用 `src/` layout，維持模組邊界清晰且易於測試與打包。下列規劃涵蓋目前（Phase 1）與未來預留位置（實際開發時僅建立當階段所需檔案）：
+採用 `src/` layout，維持模組邊界清晰且易於測試與打包。下列規劃涵蓋目前（Phase 1~2）與未來預留位置（實際開發時僅建立當階段所需檔案）：
 
 ```text
 SubtitleUI/
@@ -155,26 +161,35 @@ SubtitleUI/
 │   └── subtitleui/
 │       ├── __init__.py
 │       ├── __main__.py          # (Phase 1) 支援 `python -m subtitleui`
-│       ├── cli.py               # (Phase 1) 輕量 CLI 入口與進度顯示
+│       ├── cli.py               # (Phase 1~2) 輕量 CLI 入口（下載與本機 ASR 辨識）
 │       ├── downloader/          # (Phase 1) 影片與音訊下載模組
 │       │   ├── __init__.py
 │       │   ├── errors.py        # 自訂錯誤類型階層
 │       │   ├── models.py        # 下載請求、進度與結果資料結構
 │       │   ├── validators.py    # 網址、音訊格式與輸出目錄驗證
 │       │   └── service.py       # yt-dlp Python API 下載核心實作
-│       ├── asr/                 # (Phase 2 預留，現階段不建立)
+│       ├── asr/                 # (Phase 2) 本機 Faster-Whisper 語音辨識模組
+│       │   ├── __init__.py
+│       │   ├── errors.py        # ASR 自訂錯誤類型階層
+│       │   ├── models.py        # 設定、進度、片段、結果與 CancellationToken
+│       │   ├── time_utils.py    # 時間格式解析、區間驗證與時間戳記偏移
+│       │   ├── audio.py         # FFprobe 探測與 FFmpeg 16kHz 單聲道 WAV 擷取
+│       │   ├── hardware.py      # Windows NVIDIA DLL 註冊與 CUDA/CPU 備援策略
+│       │   ├── storage.py       # 統一 UTF-8 JSON 逐字稿讀寫
+│       │   └── engine.py        # 可重用 TranscriptionEngine 辨識核心
 │       ├── transcript/          # (Phase 3 預留，現階段不建立)
 │       ├── ui/                  # (Phase 4~5 預留，現階段不建立)
 │       └── learning/            # (Phase 6 預留，現階段不建立)
 ├── tests/
 │   ├── __init__.py
 │   ├── test_downloader.py       # (Phase 1) 下載模組與驗證單元測試
-│   └── test_cli.py              # (Phase 1) CLI 入口與錯誤處理測試
+│   ├── test_asr.py              # (Phase 2) ASR 引擎、時間偏移、備援、取消與 FFmpeg 測試
+│   └── test_cli.py              # (Phase 1~2) CLI 下載與辨識流程測試
 ├── downloads/                   # 預設下載輸出資料夾（不納入 Git）
-├── models/                      # 未來本機 ASR 模型資料夾（不納入 Git）
-├── main.py                      # (Phase 1) 根目錄快速啟動腳本
+├── models/                      # 本機 Faster-Whisper 模型快取資料夾（不納入 Git）
+├── main.py                      # (Phase 1~2) 根目錄快速啟動腳本
 ├── .gitignore
-└── requirements.txt             # 執行期最小依賴（僅 yt-dlp）
+└── requirements.txt             # 執行期核心依賴（yt-dlp、faster-whisper）
 ```
 
 ---
@@ -229,7 +244,42 @@ SubtitleUI/
     8. CLI 命令列模式、互動模式、錯誤處理與中斷結束碼驗證。
 - **尚未解決問題與注意事項**：
   1. 本階段自動化測試採 Mock（`FakeYoutubeDL`）與 `yt_dlp.YoutubeDL` 選項煙霧測試，尚未納入需要真實外部網路連線的端對端影片下載測試（因外部平台頁面與限制隨時可能變動，如 YouTube 需登入或年齡限制影片）。
-  2. 尚未支援下載取消 token（目前由 `KeyboardInterrupt` 處理 CLI 中斷）；Phase 4 開發桌面 GUI 時，建議於 `progress_hook` 加入可觸發中止的取消旗標（cancellation token）以支援介面「取消下載」按鈕。
+  2. Phase 1 目前僅透過 `KeyboardInterrupt` 處理 CLI 中斷，尚未實作外部取消旗標；**已納入 Phase 4 正式開發項目**，將於 Phase 4 開發桌面 GUI 時於 `progress_hook` 補充可外部觸發的非同步取消機制（Cancellation Token），以支援介面「取消下載」按鈕。
   3. 目標網址為播放清單時目前預設 `noplaylist=True` 僅下載單支影片，批次下載將於後續階段視需求擴充。
   4. 本機 Windows 系統 PATH 中 `python` 指向 Microsoft Store alias，開發與啟動時需使用 `.venv\Scripts\python.exe` 或 `py` launcher。
+
+### Phase 2 狀態
+- **目前狀態**：已完成（Completed）
+- **完成日期**：2026-11-20
+- **環境與依賴版本**：
+  - Python `3.10.11`（`.venv`）
+  - `faster-whisper` `1.2.1`
+  - `ctranslate2` `4.9.0`
+  - `nvidia-cublas-cu12` `12.9.2.10`、`nvidia-cudnn-cu12` `9.28.1.4`、`nvidia-cuda-nvrtc-cu12` `12.9.86`（Windows GPU 執行期加速）
+  - FFmpeg / FFprobe `9.0-full_build`
+  - 本機實測硬體：NVIDIA GeForce GTX 1660 Ti（6 GB VRAM，Driver `591.74` / CUDA `13.1`）、16 GB RAM、Windows
+- **實作摘要**：
+  - 建立獨立本機 ASR 模組 `src/subtitleui/asr/`（`errors.py`、`models.py`、`time_utils.py`、`audio.py`、`hardware.py`、`storage.py`、`engine.py`），將模型載入、音訊擷取、ASR 推論與 JSON 持久化職責完全分離，方便 Phase 4 GUI 直接非同步呼叫。
+  - 支援整部影片（模式 A）與自訂時間範圍（模式 B），提供 `HH:MM:SS` / `MM:SS` / 秒數解析與邊界驗證（負數、格式錯誤、起訖相同、結束小於開始、超出影片總長度）。
+  - `AudioExtractor` 以 `ffprobe` 驗證音訊軌與總長度，並以 `ffmpeg` 精確解碼（`-ss` 置於 `-i` 後，不使用 stream copy）擷取 16 kHz 單聲道 `pcm_s16le` WAV 至暫存目錄，驗證實際長度並於辨識結束／取消／錯誤後自動清理暫存檔。
+  - `TranscriptionEngine` 可重複使用已載入之 Faster-Whisper 模型（不重複初始化），正確迭代 `segments` generator，完整執行時間戳記偏移公式 `original_timestamp = segment_timestamp + selected_start_time`，保留原始韓文輸出不翻譯改寫，僅在模型有回報時記錄 `language_probability`。
+  - 建立執行期硬體策略與 `register_nvidia_dll_directories()`，於 `auto` 模式優先採用 `CUDA + FP16`，若無 GPU、缺少 CUDA/cuDNN DLL 或初始化／首次推論發生 CUDA 錯誤時自動切換至 `CPU + INT8`。
+  - 支援合作式取消機制（`CancellationToken` + `KeyboardInterrupt`）與非阻塞式階段狀態回報（顯示模型、運算裝置、處理階段、已處理音訊時間與實際耗時，不偽造百分比進度）。
+  - 擴充 CLI（`src/subtitleui/cli.py`）新增 `transcribe` 子命令（支援命令列參數與互動模式），同時完全相容 Phase 1 下載指令。
+- **模型設定與相容性**：
+  - 支援常用模型：`small`、`medium`（預設）、`large-v3`、`large-v3-turbo`（並支援本機模型資料夾路徑），可透過 `--model` 或 `ModelConfig` 動態指定，未在程式碼寫死。
+  - 模型快取於專案根目錄 `models/`（已加入 `.gitignore`），首次下載顯示清楚提示，後續直接讀取本機快取；並設定 `HF_HUB_DISABLE_SYMLINKS_WARNING=1` 避免 Windows 非開發者模式出現大量警告。
+  - **GTX 1660 Ti（6 GB VRAM）相容性**：`ctranslate2 4.9.0` 需搭配 CUDA 12（`cublas64_12.dll`）與 cuDNN 9（`cudnn_ops64_9.dll`）；透過 `.venv` 內安裝 `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` 並由 `hardware.py` 註冊 DLL 路徑即可在無全域 CUDA Toolkit 環境下啟用 `CUDA + FP16`。`medium`（FP16）於 6 GB VRAM 運作流暢；`large-v3` / `large-v3-turbo` 記憶體佔用較高，若系統同時執行其他佔用 VRAM 程式可能觸發 OOM，於 `auto` 模式下將自動備援切換至 `CPU + INT8`。
+- **測試結果**：
+  - 自動化單元與 FFmpeg 整合測試（`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`）：**41 / 41 項測試全部通過**（涵蓋 Phase 1 原有 20 項 + Phase 2 新增 21 項，含整部與多組自訂區間辨識、時間戳記偏移、所有無效時間邊界、缺少音訊、無語音片段、模型載入失敗、GPU 不可用／初始化失敗／推論期 CUDA 錯誤備援、取消辨識、JSON 讀寫往返、真實 FFmpeg 16kHz 單聲道擷取與暫存清理，以及 CLI 測試）。
+  - 真實韓文音訊實測（20 秒三句韓文測試檔 `downloads/korean_test_sample.wav`，模型 `medium`）：
+    - 模式 A（整部 00:00:00 ~ 00:00:20，GTX 1660 Ti `CUDA / float16`）：首次下載模型 + 推論總耗時 `42.24s`（純推論 `4.2s`），準確辨識全部 3 句韓文（`0.0~6.0`、`6.0~13.0`、`13.0~19.0`）。
+    - 模式 B（自訂區間 `00:00:06 ~ 00:00:13`，GTX 1660 Ti `CUDA / float16`，讀取快取）：總耗時 `5.84s`，僅辨識該區間第 2 句，時間戳記正確偏移為 `6.0 ~ 12.0`。
+    - 模式 B（自訂區間 `00:00:13 ~ 00:00:20`，`CPU / int8`）：總耗時 `9.76s`，僅辨識該區間第 3 句，時間戳記正確偏移為 `13.0 ~ 18.0`。
+    - 靜音音訊實測（3 秒靜音 WAV，`CUDA / float16`）：安全回傳空片段 `segments = ()`，未發生崩潰。
+- **尚未解決問題與注意事項**：
+  1. 自訂時間範圍目前採精確區間切割，若使用者起訖時間剛好落在句子中間，首尾文字可能不完整；後續階段可加入可設定之前後文緩衝秒數（context padding）。
+  2. 目前以 segment 級別時間戳記為主；若 Phase 3 / Phase 5 需要更細緻的單字級高亮，可於 `TranscriptionRequest` 擴充 `word_timestamps` 選項。
+  3. 首次下載大型模型若未設定 `HF_TOKEN` 環境變數，Hugging Face Hub 可能顯示匿名限速提示（不影響本機下載與快取運作）。
+  4. `large-v3` 在 6 GB VRAM 環境同時開啟其他 GPU 程式時可能觸發記憶體不足，建議優先使用預設 `medium` 或 `small`，必要時改用 `--device cpu`。
 

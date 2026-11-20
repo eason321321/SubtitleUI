@@ -15,8 +15,15 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from subtitleui.asr import (  # noqa: E402
+    CancellationToken,
+    ModelConfig,
+    TranscriptionEngine,
+    load_transcript_json,
+)
 from subtitleui.cli import main  # noqa: E402
 from subtitleui.downloader import MediaDownloader  # noqa: E402
+from tests.test_asr import FakeWhisperModel, _FakeRawSegment, _make_mock_extractor  # noqa: E402
 from tests.test_downloader import FakeYoutubeDL  # noqa: E402
 
 
@@ -137,6 +144,141 @@ class TestCLI(unittest.TestCase):
 
             self.assertEqual(exit_code, 130)
             self.assertIn("下載中斷", stderr.getvalue())
+
+
+class TestTranscribeCLI(unittest.TestCase):
+    """Tests for Phase 2 CLI local ASR transcription subcommand."""
+
+    def test_cli_transcribe_full_audio_and_custom_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media_file = Path(tmp) / "korean_clip.mp4"
+            media_file.write_bytes(b"fake-media")
+            out_json = Path(tmp) / "custom_range.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            def fake_engine_factory(cfg: ModelConfig) -> TranscriptionEngine:
+                return TranscriptionEngine(
+                    cfg,
+                    audio_extractor=_make_mock_extractor(source_duration=1200.0),
+                    model_factory=lambda name, **kw: FakeWhisperModel(
+                        segments=[_FakeRawSegment(2.5, 6.8, " 오늘은 날씨가 정말 좋네요.")]
+                    ),
+                    cuda_checker=lambda: (True, None),
+                )
+
+            exit_code = main(
+                [
+                    "transcribe",
+                    str(media_file),
+                    "--model",
+                    "medium",
+                    "--start",
+                    "00:12:30",
+                    "--end",
+                    "00:18:00",
+                    "-o",
+                    str(out_json),
+                    "--model-dir",
+                    str(Path(tmp) / "models"),
+                ],
+                engine_factory=fake_engine_factory,
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr.getvalue(), "")
+            output = stdout.getvalue()
+            self.assertIn("辨識摘要", output)
+            self.assertIn("00:12:30 ~ 00:18:00", output)
+            self.assertIn("오늘은 날씨가 정말 좋네요.", output)
+
+            loaded = load_transcript_json(out_json)
+            self.assertEqual(loaded.metadata.range_start, 750.0)
+            self.assertEqual(loaded.metadata.range_end, 1080.0)
+            self.assertEqual(loaded.segments[0].start, 752.5)
+            self.assertEqual(loaded.segments[0].end, 756.8)
+
+    def test_cli_transcribe_interactive_custom_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media_file = Path(tmp) / "sample.m4a"
+            media_file.write_bytes(b"fake-audio")
+            out_json = Path(tmp) / "interactive.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            responses = iter(
+                [str(media_file), "small", "2", "00:01:00", "00:02:00", str(out_json)]
+            )
+
+            def fake_engine_factory(cfg: ModelConfig) -> TranscriptionEngine:
+                return TranscriptionEngine(
+                    cfg,
+                    audio_extractor=_make_mock_extractor(source_duration=300.0),
+                    model_factory=lambda name, **kw: FakeWhisperModel(
+                        segments=[_FakeRawSegment(1.0, 4.0, " 안녕하세요.")]
+                    ),
+                    cuda_checker=lambda: (False, "cpu only"),
+                )
+
+            exit_code = main(
+                ["transcribe", "--model-dir", str(Path(tmp) / "models")],
+                engine_factory=fake_engine_factory,
+                input_func=lambda: next(responses),
+                stdout=stdout,
+                stderr=stderr,
+            )
+
+            self.assertEqual(exit_code, 0)
+            loaded = load_transcript_json(out_json)
+            self.assertEqual(loaded.metadata.model, "small")
+            self.assertEqual(loaded.segments[0].start, 61.0)
+            self.assertEqual(loaded.segments[0].end, 64.0)
+
+    def test_cli_transcribe_handles_invalid_range_and_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media_file = Path(tmp) / "short.mp4"
+            media_file.write_bytes(b"fake")
+
+            def fake_engine_factory(cfg: ModelConfig) -> TranscriptionEngine:
+                return TranscriptionEngine(
+                    cfg,
+                    audio_extractor=_make_mock_extractor(source_duration=60.0),
+                    model_factory=lambda name, **kw: FakeWhisperModel(),
+                    cuda_checker=lambda: (False, "cpu"),
+                )
+
+            # Invalid time range
+            stderr_err = io.StringIO()
+            code_err = main(
+                [
+                    "transcribe",
+                    str(media_file),
+                    "--start",
+                    "00:00:30",
+                    "--end",
+                    "00:05:00",
+                ],
+                engine_factory=fake_engine_factory,
+                stdout=io.StringIO(),
+                stderr=stderr_err,
+            )
+            self.assertEqual(code_err, 1)
+            self.assertIn("辨識失敗", stderr_err.getvalue())
+
+            # Cancelled transcription
+            token = CancellationToken()
+            token.cancel()
+            stderr_cancel = io.StringIO()
+            code_cancel = main(
+                ["transcribe", str(media_file)],
+                engine_factory=fake_engine_factory,
+                cancel_token=token,
+                stdout=io.StringIO(),
+                stderr=stderr_cancel,
+            )
+            self.assertEqual(code_cancel, 130)
+            self.assertIn("辨識已取消", stderr_cancel.getvalue())
 
 
 if __name__ == "__main__":
