@@ -149,28 +149,32 @@
 
 ```text
 SubtitleUI/
-├── markdown/
-│   └── DEVELOPMENT_ROADMAP.md   # 專案開發地圖與進度紀錄
+├── Markdown/
+│   └── DEVELOPMENT_ROADMAP.md   # 專案開發地圖與進度紀錄（保留目錄既有大小寫）
 ├── src/
 │   └── subtitleui/
 │       ├── __init__.py
-│       ├── cli.py               # (Phase 1) CLI 入口
+│       ├── __main__.py          # (Phase 1) 支援 `python -m subtitleui`
+│       ├── cli.py               # (Phase 1) 輕量 CLI 入口與進度顯示
 │       ├── downloader/          # (Phase 1) 影片與音訊下載模組
 │       │   ├── __init__.py
-│       │   ├── models.py        # 下載設定、進度與結果資料結構
-│       │   ├── errors.py        # 自訂錯誤類型
-│       │   └── service.py       # yt-dlp 下載核心實作
+│       │   ├── errors.py        # 自訂錯誤類型階層
+│       │   ├── models.py        # 下載請求、進度與結果資料結構
+│       │   ├── validators.py    # 網址、音訊格式與輸出目錄驗證
+│       │   └── service.py       # yt-dlp Python API 下載核心實作
 │       ├── asr/                 # (Phase 2 預留，現階段不建立)
 │       ├── transcript/          # (Phase 3 預留，現階段不建立)
 │       ├── ui/                  # (Phase 4~5 預留，現階段不建立)
 │       └── learning/            # (Phase 6 預留，現階段不建立)
 ├── tests/
-│   └── test_downloader.py       # (Phase 1) 下載模組與 CLI 測試
+│   ├── __init__.py
+│   ├── test_downloader.py       # (Phase 1) 下載模組與驗證單元測試
+│   └── test_cli.py              # (Phase 1) CLI 入口與錯誤處理測試
 ├── downloads/                   # 預設下載輸出資料夾（不納入 Git）
 ├── models/                      # 未來本機 ASR 模型資料夾（不納入 Git）
+├── main.py                      # (Phase 1) 根目錄快速啟動腳本
 ├── .gitignore
-├── requirements.txt             # 執行期最小依賴
-└── README.md                    # 專案簡介與使用說明（視需求維護）
+└── requirements.txt             # 執行期最小依賴（僅 yt-dlp）
 ```
 
 ---
@@ -198,7 +202,34 @@ SubtitleUI/
 ## 9. 開發進度與階段紀錄
 
 ### Phase 1 狀態
-- **目前狀態**：初始化完成，準備進入 Phase 1 實作。
-- **實作摘要**：（待 Phase 1 完成後更新）
-- **測試結果**：（待 Phase 1 測試後更新）
-- **尚未解決問題**：（待記錄）
+- **目前狀態**：已完成（Completed）
+- **完成日期**：2026-11-20
+- **環境與依賴版本**：
+  - Python `3.10.11`（透過 Windows `py` launcher 建立 `.venv`）
+  - `yt-dlp` `2026.10.21`
+  - FFmpeg `9.0-full_build`（系統 PATH 可用）
+  - 測試工具：Python 標準庫 `unittest`（零額外測試套件依賴）
+- **實作摘要**：
+  - 建立獨立下載模組 `src/subtitleui/downloader/`（`models.py`、`errors.py`、`validators.py`、`service.py`），以 `yt-dlp` Python API 串流寫入磁碟，不將整個媒體檔載入記憶體。
+  - 支援 `video`（有 FFmpeg 時合併為 `mp4`，無 FFmpeg 時自動降級單一串流）與 `audio`（透過 FFmpeg 提取音訊，預設 `m4a`，可指定 `mp3`/`wav` 等格式）兩種模式。
+  - 支援自動建立不存在的輸出目錄、保留韓文檔名並移除 Windows 非法字元（`windowsfilenames=True`）。
+  - 支援同名檔案衝突策略：`skip`（預設略過並回傳既有檔案）、`overwrite`（覆寫）、`fail`（拋出 `FileAlreadyExistsError`）。
+  - 提供結構化 `DownloadProgress` callback 機制，可供 CLI 即時顯示進度，亦可於 Phase 4 直接銜接 PySide6 GUI。
+  - 建立簡潔 CLI 入口（`main.py` / `src/subtitleui/cli.py`），支援命令列參數與互動式輸入，所有下載錯誤與中斷皆安全攔截，不造成程式崩潰。
+- **測試結果**：
+  - 執行 `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`：**20 / 20 項測試全部通過（0.170s）**。
+  - 測試涵蓋項目：
+    1. 有效影片網址下載（含韓文標題、進度回報序列、中繼資料與檔案大小驗證）。
+    2. 無效網址驗證（空白、缺協定、不支援協定、畸形主機、包含空白、extractor 回報不支援網址）。
+    3. 網路連線失敗映射（DNS 解析失敗、逾時、`URLError`、`TimeoutError` → `NetworkDownloadError`）。
+    4. 下載中斷或失敗（`KeyboardInterrupt`、傳輸中斷、`PostProcessingError`、缺少 FFmpeg、影片不可用、無效音訊格式、下載結束後檔案遺失）。
+    5. 輸出目錄不存在自動建立，以及輸出路徑指向一般檔案時報錯。
+    6. 已存在同名檔案的三種策略（`skip` / `overwrite` / `fail`）。
+    7. 影片（有／無 FFmpeg）與音訊兩種下載模式及真實 `yt_dlp.YoutubeDL` 選項相容性煙霧測試。
+    8. CLI 命令列模式、互動模式、錯誤處理與中斷結束碼驗證。
+- **尚未解決問題與注意事項**：
+  1. 本階段自動化測試採 Mock（`FakeYoutubeDL`）與 `yt_dlp.YoutubeDL` 選項煙霧測試，尚未納入需要真實外部網路連線的端對端影片下載測試（因外部平台頁面與限制隨時可能變動，如 YouTube 需登入或年齡限制影片）。
+  2. 尚未支援下載取消 token（目前由 `KeyboardInterrupt` 處理 CLI 中斷）；Phase 4 開發桌面 GUI 時，建議於 `progress_hook` 加入可觸發中止的取消旗標（cancellation token）以支援介面「取消下載」按鈕。
+  3. 目標網址為播放清單時目前預設 `noplaylist=True` 僅下載單支影片，批次下載將於後續階段視需求擴充。
+  4. 本機 Windows 系統 PATH 中 `python` 指向 Microsoft Store alias，開發與啟動時需使用 `.venv\Scripts\python.exe` 或 `py` launcher。
+
