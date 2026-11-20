@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
@@ -72,6 +73,16 @@ _INVALID_URL_KEYWORDS = (
     "unsupported url",
 )
 
+# Prefer H.264 (avc1) + AAC (mp4a/m4a) so merged MP4 files play with sound
+# natively on Windows Media Player, Movies & TV, and Qt Multimedia.
+VIDEO_MP4_COMPATIBLE_FORMAT = (
+    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+    "best[ext=mp4]/bestvideo+bestaudio/best"
+)
+
+_MP4_COMPATIBLE_AUDIO_PREFIXES = ("mp4a", "aac", "mp3")
+
 
 class _SilentLogger:
     """Captures yt-dlp log messages silently to keep library output clean."""
@@ -97,6 +108,17 @@ def _find_ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 
 
+def _default_ffmpeg_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
 class MediaDownloader:
     """Modular video/audio downloader reusable across CLI and future GUI."""
 
@@ -104,9 +126,11 @@ class MediaDownloader:
         self,
         ydl_factory: Callable[[dict[str, Any]], Any] | None = None,
         ffmpeg_checker: Callable[[], str | None] | None = None,
+        ffmpeg_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
     ) -> None:
         self._ydl_factory = ydl_factory or yt_dlp.YoutubeDL
         self._ffmpeg_checker = ffmpeg_checker or _find_ffmpeg
+        self._ffmpeg_runner = ffmpeg_runner or _default_ffmpeg_runner
 
     def download(
         self,
@@ -238,6 +262,18 @@ class MediaDownloader:
             )
             raise err
 
+        if (
+            normalized_request.mode == DownloadMode.VIDEO
+            and ffmpeg_path
+            and final_path.suffix.lower() == ".mp4"
+        ):
+            self._ensure_compatible_mp4_audio(
+                final_path=final_path,
+                info=info,
+                ffmpeg_path=ffmpeg_path,
+                progress_callback=progress_callback,
+            )
+
         file_size = final_path.stat().st_size
         self._emit_progress(
             progress_callback,
@@ -367,12 +403,113 @@ class MediaDownloader:
             ]
         else:
             if has_ffmpeg:
-                options["format"] = "bestvideo+bestaudio/best"
+                options["format"] = VIDEO_MP4_COMPATIBLE_FORMAT
                 options["merge_output_format"] = "mp4"
             else:
                 options["format"] = "best[ext=mp4]/best"
 
         return options
+
+    def _ensure_compatible_mp4_audio(
+        self,
+        *,
+        final_path: Path,
+        info: dict[str, Any],
+        ffmpeg_path: str,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
+        """Transcode non-AAC audio (e.g. Opus/Vorbis) inside MP4 to AAC for Windows playback."""
+        acodec = self._extract_audio_codec(info)
+        if not acodec:
+            return
+        if acodec.startswith(_MP4_COMPATIBLE_AUDIO_PREFIXES):
+            return
+
+        self._emit_progress(
+            progress_callback,
+            DownloadProgress(
+                status=DownloadStatus.POSTPROCESSING,
+                percentage=100.0,
+                filename=str(final_path),
+                message=f"偵測到 MP4 音訊編碼為 {acodec}，正在轉為相容性較佳的 AAC 音訊...",
+            ),
+        )
+
+        temp_output = final_path.with_name(f"{final_path.stem}.aac_tmp{final_path.suffix}")
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(final_path),
+            "-map",
+            "0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(temp_output),
+        ]
+        try:
+            proc = self._ffmpeg_runner(cmd)
+        except OSError as exc:
+            temp_output.unlink(missing_ok=True)
+            err = ExternalToolError(f"執行 FFmpeg 轉碼 MP4 音訊失敗：{exc}")
+            self._emit_progress(
+                progress_callback,
+                DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
+            )
+            raise err from exc
+
+        if proc.returncode != 0 or not temp_output.exists() or temp_output.stat().st_size == 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            temp_output.unlink(missing_ok=True)
+            err = ExternalToolError(
+                f"FFmpeg 轉碼 MP4 音訊為 AAC 失敗：{detail or f'exit code {proc.returncode}'}"
+            )
+            self._emit_progress(
+                progress_callback,
+                DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
+            )
+            raise err
+
+        try:
+            temp_output.replace(final_path)
+        except OSError as exc:
+            temp_output.unlink(missing_ok=True)
+            err = MediaDownloadError(f"更新轉碼後的 MP4 檔案失敗：{exc}")
+            self._emit_progress(
+                progress_callback,
+                DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
+            )
+            raise err from exc
+
+    @staticmethod
+    def _extract_audio_codec(info: dict[str, Any]) -> str | None:
+        raw_codecs: list[Any] = [info.get("acodec")]
+        requested_downloads = info.get("requested_downloads") or []
+        for item in requested_downloads:
+            if isinstance(item, dict):
+                raw_codecs.append(item.get("acodec"))
+                for fmt in item.get("requested_formats") or []:
+                    if isinstance(fmt, dict):
+                        raw_codecs.append(fmt.get("acodec"))
+        for fmt in info.get("requested_formats") or []:
+            if isinstance(fmt, dict):
+                raw_codecs.append(fmt.get("acodec"))
+
+        for codec in raw_codecs:
+            if isinstance(codec, str):
+                cleaned = codec.strip().lower()
+                if cleaned and cleaned != "none":
+                    return cleaned
+        return None
 
     @staticmethod
     def _unwrap_entry(info: Any) -> dict[str, Any]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -35,6 +36,9 @@ from subtitleui.downloader import (  # noqa: E402
 )
 
 
+from subtitleui.downloader.service import VIDEO_MP4_COMPATIBLE_FORMAT  # noqa: E402
+
+
 class FakeYoutubeDL:
     """Deterministic yt-dlp fake that writes tiny placeholder files on disk."""
 
@@ -51,6 +55,7 @@ class FakeYoutubeDL:
         error_on_download: Exception | None = None,
         skip_file_creation: bool = False,
         record_calls: list[dict[str, Any]] | None = None,
+        acodec: str | None = "mp4a.40.2",
     ) -> None:
         self.options = options
         self.title = title
@@ -62,6 +67,7 @@ class FakeYoutubeDL:
         self.error_on_download = error_on_download
         self.skip_file_creation = skip_file_creation
         self.record_calls = record_calls if record_calls is not None else []
+        self.acodec = acodec
 
     def __enter__(self) -> FakeYoutubeDL:
         return self
@@ -91,6 +97,7 @@ class FakeYoutubeDL:
             "ext": self.ext,
             "duration": self.duration,
             "webpage_url": url,
+            "acodec": self.acodec,
         }
 
         if not download:
@@ -243,12 +250,66 @@ class TestMediaDownloader(unittest.TestCase):
             self.assertIn(DownloadStatus.POSTPROCESSING, statuses)
             self.assertEqual(statuses[-1], DownloadStatus.FINISHED)
 
-            # Verify yt-dlp video options with FFmpeg available
+            # Verify yt-dlp video options with FFmpeg available prefer Windows-compatible MP4 codecs
             dl_opts = calls[-1]["options"]
-            self.assertEqual(dl_opts["format"], "bestvideo+bestaudio/best")
+            self.assertEqual(dl_opts["format"], VIDEO_MP4_COMPATIBLE_FORMAT)
+            self.assertIn("vcodec^=avc1", dl_opts["format"])
+            self.assertIn("acodec^=mp4a", dl_opts["format"])
             self.assertEqual(dl_opts["merge_output_format"], "mp4")
             self.assertTrue(dl_opts["noplaylist"])
             self.assertTrue(dl_opts["windowsfilenames"])
+
+    def test_video_mp4_skips_transcode_when_audio_is_already_aac(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ffmpeg_cmds: list[list[str]] = []
+
+            def fake_ffmpeg(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+                ffmpeg_cmds.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            downloader = MediaDownloader(
+                ydl_factory=lambda opts: FakeYoutubeDL(opts, acodec="mp4a.40.2"),
+                ffmpeg_checker=lambda: "ffmpeg",
+                ffmpeg_runner=fake_ffmpeg,
+            )
+            result = downloader.download(
+                DownloadRequest(
+                    url="https://www.youtube.com/watch?v=aac001",
+                    mode=DownloadMode.VIDEO,
+                    output_dir=Path(tmp),
+                )
+            )
+            self.assertTrue(result.file_path.exists())
+            self.assertEqual(ffmpeg_cmds, [])
+
+    def test_video_mp4_transcodes_opus_audio_to_aac_for_windows_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ffmpeg_cmds: list[list[str]] = []
+
+            def fake_ffmpeg(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+                ffmpeg_cmds.append(cmd)
+                Path(cmd[-1]).write_bytes(b"mp4-with-aac-audio")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            downloader = MediaDownloader(
+                ydl_factory=lambda opts: FakeYoutubeDL(opts, acodec="opus"),
+                ffmpeg_checker=lambda: "ffmpeg",
+                ffmpeg_runner=fake_ffmpeg,
+            )
+            result = downloader.download(
+                DownloadRequest(
+                    url="https://www.youtube.com/watch?v=opus001",
+                    mode=DownloadMode.VIDEO,
+                    output_dir=Path(tmp),
+                )
+            )
+            self.assertEqual(len(ffmpeg_cmds), 1)
+            self.assertIn("-c:v", ffmpeg_cmds[0])
+            self.assertIn("copy", ffmpeg_cmds[0])
+            self.assertIn("-c:a", ffmpeg_cmds[0])
+            self.assertIn("aac", ffmpeg_cmds[0])
+            self.assertEqual(result.file_path.read_bytes(), b"mp4-with-aac-audio")
+            self.assertEqual(result.file_size, len(b"mp4-with-aac-audio"))
 
     def test_video_download_fallback_format_without_ffmpeg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
