@@ -1,0 +1,68 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+htmlcov/
+
+# Environment variables & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Downloaded media & local models
+downloads/
+models/
+
+# Temporary / media files (prevent accidental commits)
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.avi
+*.flv
+*.wmv
+*.mp3
+*.m4a
+*.wav
+*.flac
+*.ogg
+*.opus
+*.aac
+*.part
+*.ytdl
+*.tmp
+*.temp
+*.f[0-9][0-9][0-9].*
+
+# Logs
+*.log
+
+# IDE & editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
