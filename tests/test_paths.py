@@ -14,16 +14,22 @@ if str(SRC_DIR) not in sys.path:
 
 from subtitleui.paths import (  # noqa: E402
     AUDIO_OUTPUT_DIR,
+    CONFIG_DIR,
     DOWNLOAD_DIR,
     MODELS_DIR,
+    NLLB_MODEL_DIR,
     OUTPUT_DIR,
     PROJECT_ROOT,
     TEMP_DIR,
     TRANSCRIPTION_DIR,
+    TRANSLATION_DIR,
     default_audio_output_path,
     default_transcript_output_path,
+    default_translation_output_path,
     ensure_dir,
     resolve_media_input_path,
+    resolve_transcript_input_path,
+    transcript_stem,
 )
 
 
@@ -84,6 +90,33 @@ class TestPaths(unittest.TestCase):
             created = ensure_dir(nested)
             self.assertTrue(created.exists())
             self.assertTrue(created.is_dir())
+
+    def test_translation_path_helpers(self) -> None:
+        self.assertEqual(CONFIG_DIR, PROJECT_ROOT / "config")
+        self.assertEqual(TRANSLATION_DIR, OUTPUT_DIR / "translation")
+        self.assertEqual(NLLB_MODEL_DIR, MODELS_DIR / "nllb")
+
+        transcript_file = TRANSCRIPTION_DIR / "Wait, you guys knew each other？ [wTXo0uObVaE].transcript.json"
+        self.assertEqual(
+            transcript_stem(transcript_file),
+            "Wait, you guys knew each other？ [wTXo0uObVaE]",
+        )
+        out_path = default_translation_output_path(transcript_file)
+        self.assertEqual(out_path.parent, TRANSLATION_DIR)
+        self.assertEqual(
+            out_path.name,
+            "Wait, you guys knew each other？ [wTXo0uObVaE].zh-TW.translation.json",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_tr_dir = Path(tmp) / "outputs" / "transcription"
+            fake_tr_dir.mkdir(parents=True)
+            sample = fake_tr_dir / "sample.transcript.json"
+            sample.write_text("{}", encoding="utf-8")
+            resolved = resolve_transcript_input_path(
+                "sample.transcript.json", transcription_dir=fake_tr_dir
+            )
+            self.assertEqual(resolved, sample.resolve())
 
 
 if __name__ == "__main__":

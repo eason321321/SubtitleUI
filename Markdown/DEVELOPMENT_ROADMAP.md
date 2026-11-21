@@ -12,7 +12,7 @@
 
 1. **Local-first**：優先採用本機運算與本機檔案管理，不依賴付費雲端 API。
 2. **Lightweight**：精簡依賴，避免不必要的框架、背景服務或過度膨脹的套件。
-3. **Modular**：將下載、辨識、逐字稿處理、匯出、介面等職責拆分為獨立模組，確保核心邏輯與 UI 解耦，方便後續替換模型或擴充功能。
+3. **Modular**：將下載、辨識、翻譯、逐字稿處理、匯出、介面等職責拆分為獨立模組，確保核心邏輯與 UI 解耦，方便後續替換模型或擴充功能。
 4. **Incremental Development**：嚴格遵循分階段循序開發，僅實作當前階段範圍內的功能，不提前堆砌未排定需求的程式碼。
 5. **Maintainability**：保持程式碼結構清晰、介面明確、錯誤處理完善，避免過度工程化。
 
@@ -20,19 +20,20 @@
 
 ## 3. 技術架構
 
-整體採分層與模組化設計，將核心業務邏輯（下載、ASR、逐字稿處理）與操作介面（初期 CLI、後續 PySide6 GUI）分離：
+整體採分層與模組化設計，將核心業務邏輯（下載、ASR、翻譯、逐字稿處理）與操作介面（初期 CLI、後續 PySide6 GUI）分離：
 
 ```text
 [ 使用者介面層 ]
-  Phase 1~3: CLI 入口 (main.py / cli)
-  Phase 4~6: 桌面 GUI (PySide6)
+  Phase 1~4: CLI 入口 (main.py / cli)
+  Phase 5~7: 桌面 GUI (PySide6)
         │
         ▼
 [ 核心功能模組層 (src/subtitleui/) ]
   ├── downloader/   (Phase 1) 影片/音訊下載、進度回報、錯誤封裝
   ├── asr/          (Phase 2) 本機語音辨識 (Faster-Whisper)
-  ├── transcript/   (Phase 3) 斷句、時間戳整理、SRT/TXT/JSON 匯出
-  └── learning/     (Phase 6) 單字查詢、翻譯、收藏與學習紀錄
+  ├── translator/   (Phase 3) 逐字稿文字翻譯（獨立模組，支援指定片段／全文翻譯）
+  ├── transcript/   (Phase 4) 斷句、時間戳整理、SRT/TXT/JSON 匯出
+  └── learning/     (Phase 7) 單字查詢、收藏與學習紀錄
         │
         ▼
 [ 本機外部工具與資料層 ]
@@ -53,7 +54,9 @@
 | **pytest**（開發測試） | Phase 1 | 單元測試與 Mock 測試執行（亦相容標準庫 `unittest`） |
 | **Faster-Whisper / CTranslate2** | Phase 2 | 基於 CTranslate2 的高效本機 Whisper 語音辨識引擎（支援 CUDA FP16 / CPU INT8） |
 | **nvidia-cublas-cu12 / nvidia-cudnn-cu12**（選用） | Phase 2 | Windows NVIDIA GPU 加速所需之 CUDA 12 / cuDNN 9 執行期函式庫（未安裝時自動降級 CPU INT8） |
-| **PySide6** | Phase 4 | 跨平台桌面 GUI 框架（Qt for Python） |
+| **PyYAML** | Phase 3 | 讀取與驗證 `config/config.yaml` 翻譯與後端設定檔 |
+| **CTranslate2 + tokenizers / huggingface_hub**（複用） | Phase 3 | CT2-NLLB 本機離線翻譯引擎（NLLB-200-distilled-600M 量化版，免 PyTorch） |
+| **PySide6** | Phase 5 | 跨平台桌面 GUI 框架（Qt for Python） |
 
 > 註：專案遵循最小依賴原則，每個階段僅安裝該階段實際需要的套件。
 
@@ -95,7 +98,20 @@
   - 能輸出具時間戳記的結構化原始辨識結果 JSON 檔案。
   - 能妥善處理缺少模型、無效時間範圍、音訊不存在、空音訊、取消操作與 GPU 不可用備援。
 
-### Phase 3：逐字稿處理與匯出
+### Phase 3：翻譯模組
+- **目標**：建立獨立、解耦的翻譯模組（`src/subtitleui/translator/`），讓使用者能選擇 Phase 2 `transcribe` 產生的逐字稿文字進行翻譯，並完整保留原始韓文辨識結果。
+- **核心功能**：
+  1. 建立獨立翻譯模組，與 `asr/`、`transcript/` 及介面層完全解耦，便於日後切換本機翻譯模型或可選翻譯後端。
+  2. 支援載入 Phase 2 `transcribe` 產出的逐字稿結果，讓使用者選擇要翻譯的文字範圍（指定單筆／多筆片段、指定時間區間或整份逐字稿）。
+  3. 支援韓文翻譯（預設繁體中文，並保留目標語系可配置性）。
+  4. 翻譯輸出維持與原文片段及原影片時間戳記的對應關係，另存為獨立翻譯結果而不覆寫原始 ASR JSON。
+  5. 擴充 CLI 提供翻譯操作流程，妥善處理找不到逐字稿、空內容、後端錯誤與取消操作等例外情境。
+- **完成標準**：
+  - 能透過獨立翻譯模組選擇 `transcribe` 產出的文字（指定片段或全文）進行翻譯並輸出對應結果。
+  - 原始韓文辨識 JSON 檔案維持完整保留不被覆寫。
+  - 具備完整單元測試，且模組介面可供 Phase 4 匯出與 Phase 5 桌面 GUI 直接呼叫。
+
+### Phase 4：逐字稿處理與匯出
 - **目標**：將原始 ASR 結果整理為易於閱讀、編輯與外掛使用的逐字稿格式。
 - **核心功能**：
   1. 句子切分與標點／斷句整理。
@@ -108,8 +124,8 @@
   - 能從原始辨識結果穩定轉換並匯出合法的 SRT、TXT 與 JSON 檔案。
   - 原始辨識檔案維持完整保留。
 
-### Phase 4：桌面 GUI
-- **目標**：建立簡潔直覺的桌面應用程式，整合 Phase 1~3 核心模組。
+### Phase 5：桌面 GUI
+- **目標**：建立簡潔直覺的桌面應用程式，整合 Phase 1~4 核心模組。
 - **核心技術**：Python + PySide6。
 - **核心功能**：
   1. 影片網址輸入與下載模式選擇。
@@ -117,13 +133,13 @@
   3. 非同步取消下載機制（Cancellation Token）：擴充 `downloader` 模組，於 `progress_hook` 加入可外部觸發的取消旗標（如 `threading.Event` / Cancellation Token），在觸發取消時安全中止 `yt-dlp` 下載並拋出 `DownloadInterruptedError`，支援 GUI「取消下載」按鈕。
   4. ASR 模型選擇。
   5. 語音辨識進度顯示。
-  6. 逐字稿瀏覽區顯示。
+  6. 逐字稿瀏覽區顯示與選取翻譯（整合 Phase 3 翻譯模組）。
   7. 一鍵匯出功能（SRT / TXT / JSON）。
 - **完成標準**：
-  - GUI 可直接呼叫既有核心模組完成「下載 → 辨識 → 瀏覽 → 匯出」完整流程，且操作過程介面流暢不卡死。
+  - GUI 可直接呼叫既有核心模組完成「下載 → 辨識 → 翻譯 → 瀏覽 → 匯出」完整流程，且操作過程介面流暢不卡死。
   - 使用者點擊「取消下載」按鈕時，能透過 Cancellation Token 安全中止背景下載任務並回復介面狀態，不造成程式崩潰。
 
-### Phase 5：影片與逐字稿同步
+### Phase 6：影片與逐字稿同步
 - **目標**：建立真正可用的韓文聽力學習播放介面。
 - **核心功能**：
   1. 內建影片／音訊播放器。
@@ -135,11 +151,11 @@
 - **完成標準**：
   - 影片播放與逐字稿同步誤差在可接受範圍內，點擊跳轉、單句循環與倍速播放皆運作穩定。
 
-### Phase 6：韓文學習功能
+### Phase 7：韓文學習功能
 - **目標**：將工具進一步擴充為個人化韓文聽力與詞彙學習環境。
 - **核心功能**：
   1. 單字查詢（字典／詞性／原型分析）。
-  2. 韓文中文翻譯。
+  2. 韓文中文翻譯（銜接 Phase 3 翻譯模組，支援學習介面即時選句／查詞翻譯）。
   3. 生詞收藏。
   4. 句子收藏。
   5. AI 語境解釋（支援本機或可選外部模型介面）。
@@ -157,11 +173,15 @@
 SubtitleUI/
 ├── Markdown/
 │   └── DEVELOPMENT_ROADMAP.md   # 專案開發地圖與進度紀錄（保留目錄既有大小寫）
+├── config/
+│   ├── config.example.yaml      # (Phase 3) 翻譯設定範本（納入版控）
+│   └── config.yaml              # (Phase 3) 使用者設定檔（自動建立，不納入 Git）
 ├── src/
 │   └── subtitleui/
 │       ├── __init__.py
 │       ├── __main__.py          # (Phase 1) 支援 `python -m subtitleui`
-│       ├── cli.py               # (Phase 1~2) 輕量 CLI 入口（下載與本機 ASR 辨識）
+│       ├── paths.py             # (Phase 1~3) 集中管理資料夾與預設輸出路徑
+│       ├── cli.py               # (Phase 1~3) CLI 入口（download / transcribe / translate）
 │       ├── downloader/          # (Phase 1) 影片與音訊下載模組
 │       │   ├── __init__.py
 │       │   ├── errors.py        # 自訂錯誤類型階層
@@ -177,19 +197,38 @@ SubtitleUI/
 │       │   ├── hardware.py      # Windows NVIDIA DLL 註冊與 CUDA/CPU 備援策略
 │       │   ├── storage.py       # 統一 UTF-8 JSON 逐字稿讀寫
 │       │   └── engine.py        # 可重用 TranscriptionEngine 辨識核心
-│       ├── transcript/          # (Phase 3 預留，現階段不建立)
-│       ├── ui/                  # (Phase 4~5 預留，現階段不建立)
-│       └── learning/            # (Phase 6 預留，現階段不建立)
+│       ├── translator/          # (Phase 3) 可插拔雙後端韓文翻譯模組
+│       │   ├── __init__.py
+│       │   ├── errors.py        # 翻譯錯誤類型階層
+│       │   ├── models.py        # 設定、進度、片段、結果與取消權杖
+│       │   ├── config.py        # ConfigManager（YAML 讀取、驗證、自動建立、安全憑證預留）
+│       │   ├── selector.py      # 全文／指定句子（1-based）／時間區間交集選取
+│       │   ├── storage.py       # 唯讀讀取 ASR JSON、安全合併與原子寫入翻譯 JSON
+│       │   ├── engine.py        # TranslationEngine（批次、滑動上下文、對齊重試、生命週期）
+│       │   └── backends/
+│       │       ├── __init__.py
+│       │       ├── base.py      # TranslationBackend 抽象介面
+│       │       ├── ct2_nllb.py  # CTranslate2 NLLB-200 離線翻譯後端（CUDA/CPU INT8）
+│       │       └── local_llm.py # OpenAI-compatible Local LLM 後端（Ollama / llama-server / LM Studio）
+│       ├── transcript/          # (Phase 4 預留，現階段不建立)
+│       ├── ui/                  # (Phase 5~6 預留，現階段不建立)
+│       └── learning/            # (Phase 7 預留，現階段不建立)
 ├── tests/
 │   ├── __init__.py
+│   ├── test_paths.py            # (Phase 1~3) 路徑管理與輸出位置測試
 │   ├── test_downloader.py       # (Phase 1) 下載模組與驗證單元測試
 │   ├── test_asr.py              # (Phase 2) ASR 引擎、時間偏移、備援、取消與 FFmpeg 測試
-│   └── test_cli.py              # (Phase 1~2) CLI 下載與辨識流程測試
+│   ├── test_translator.py       # (Phase 3) 設定、選取、合併、CT2-NLLB、Local LLM 與對齊重試測試
+│   └── test_cli.py              # (Phase 1~3) CLI 下載、辨識與翻譯流程測試
 ├── downloads/                   # 預設下載輸出資料夾（不納入 Git）
-├── models/                      # 本機 Faster-Whisper 模型快取資料夾（不納入 Git）
-├── main.py                      # (Phase 1~2) 根目錄快速啟動腳本
+├── outputs/
+│   ├── audio/                   # 處理後音訊輸出（不納入 Git）
+│   ├── transcription/           # Phase 2 原始 ASR JSON（不納入 Git）
+│   └── translation/             # Phase 3 獨立翻譯 JSON（不納入 Git）
+├── models/                      # 本機 ASR 與 CT2-NLLB 模型快取資料夾（不納入 Git）
+├── main.py                      # (Phase 1~3) 根目錄快速啟動腳本
 ├── .gitignore
-└── requirements.txt             # 執行期核心依賴（yt-dlp、faster-whisper）
+└── requirements.txt             # 執行期核心依賴（yt-dlp、faster-whisper、PyYAML）
 ```
 
 ---
@@ -229,7 +268,7 @@ SubtitleUI/
   - 支援 `video`（有 FFmpeg 時合併為 `mp4`，無 FFmpeg 時自動降級單一串流）與 `audio`（透過 FFmpeg 提取音訊，預設 `m4a`，可指定 `mp3`/`wav` 等格式）兩種模式。
   - 支援自動建立不存在的輸出目錄、保留韓文檔名並移除 Windows 非法字元（`windowsfilenames=True`）。
   - 支援同名檔案衝突策略：`skip`（預設略過並回傳既有檔案）、`overwrite`（覆寫）、`fail`（拋出 `FileAlreadyExistsError`）。
-  - 提供結構化 `DownloadProgress` callback 機制，可供 CLI 即時顯示進度，亦可於 Phase 4 直接銜接 PySide6 GUI。
+  - 提供結構化 `DownloadProgress` callback 機制，可供 CLI 即時顯示進度，亦可於 Phase 5 直接銜接 PySide6 GUI。
   - 建立簡潔 CLI 入口（`main.py` / `src/subtitleui/cli.py`），支援命令列參數與互動式輸入，所有下載錯誤與中斷皆安全攔截，不造成程式崩潰。
 - **測試結果**：
   - 執行 `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`：**20 / 20 項測試全部通過（0.170s）**。
@@ -244,7 +283,7 @@ SubtitleUI/
     8. CLI 命令列模式、互動模式、錯誤處理與中斷結束碼驗證。
 - **尚未解決問題與注意事項**：
   1. 本階段自動化測試採 Mock（`FakeYoutubeDL`）與 `yt_dlp.YoutubeDL` 選項煙霧測試，尚未納入需要真實外部網路連線的端對端影片下載測試（因外部平台頁面與限制隨時可能變動，如 YouTube 需登入或年齡限制影片）。
-  2. Phase 1 目前僅透過 `KeyboardInterrupt` 處理 CLI 中斷，尚未實作外部取消旗標；**已納入 Phase 4 正式開發項目**，將於 Phase 4 開發桌面 GUI 時於 `progress_hook` 補充可外部觸發的非同步取消機制（Cancellation Token），以支援介面「取消下載」按鈕。
+  2. Phase 1 目前僅透過 `KeyboardInterrupt` 處理 CLI 中斷，尚未實作外部取消旗標；**已納入 Phase 5 正式開發項目**，將於 Phase 5 開發桌面 GUI 時於 `progress_hook` 補充可外部觸發的非同步取消機制（Cancellation Token），以支援介面「取消下載」按鈕。
   3. 目標網址為播放清單時目前預設 `noplaylist=True` 僅下載單支影片，批次下載將於後續階段視需求擴充。
   4. 本機 Windows 系統 PATH 中 `python` 指向 Microsoft Store alias，開發與啟動時需使用 `.venv\Scripts\python.exe` 或 `py` launcher。
 
@@ -259,7 +298,7 @@ SubtitleUI/
   - FFmpeg / FFprobe `9.0-full_build`
   - 本機實測硬體：NVIDIA GeForce GTX 1660 Ti（6 GB VRAM，Driver `591.74` / CUDA `13.1`）、16 GB RAM、Windows
 - **實作摘要**：
-  - 建立獨立本機 ASR 模組 `src/subtitleui/asr/`（`errors.py`、`models.py`、`time_utils.py`、`audio.py`、`hardware.py`、`storage.py`、`engine.py`），將模型載入、音訊擷取、ASR 推論與 JSON 持久化職責完全分離，方便 Phase 4 GUI 直接非同步呼叫。
+  - 建立獨立本機 ASR 模組 `src/subtitleui/asr/`（`errors.py`、`models.py`、`time_utils.py`、`audio.py`、`hardware.py`、`storage.py`、`engine.py`），將模型載入、音訊擷取、ASR 推論與 JSON 持久化職責完全分離，方便 Phase 5 GUI 直接非同步呼叫。
   - 支援整部影片（模式 A）與自訂時間範圍（模式 B），提供 `HH:MM:SS` / `MM:SS` / 秒數解析與邊界驗證（負數、格式錯誤、起訖相同、結束小於開始、超出影片總長度）。
   - `AudioExtractor` 以 `ffprobe` 驗證音訊軌與總長度，並以 `ffmpeg` 精確解碼（`-ss` 置於 `-i` 後，不使用 stream copy）擷取 16 kHz 單聲道 `pcm_s16le` WAV 至暫存目錄，驗證實際長度並於辨識結束／取消／錯誤後自動清理暫存檔。
   - `TranscriptionEngine` 可重複使用已載入之 Faster-Whisper 模型（不重複初始化），正確迭代 `segments` generator，完整執行時間戳記偏移公式 `original_timestamp = segment_timestamp + selected_start_time`，保留原始韓文輸出不翻譯改寫，僅在模型有回報時記錄 `language_probability`。
@@ -279,7 +318,37 @@ SubtitleUI/
     - 靜音音訊實測（3 秒靜音 WAV，`CUDA / float16`）：安全回傳空片段 `segments = ()`，未發生崩潰。
 - **尚未解決問題與注意事項**：
   1. 自訂時間範圍目前採精確區間切割，若使用者起訖時間剛好落在句子中間，首尾文字可能不完整；後續階段可加入可設定之前後文緩衝秒數（context padding）。
-  2. 目前以 segment 級別時間戳記為主；若 Phase 3 / Phase 5 需要更細緻的單字級高亮，可於 `TranscriptionRequest` 擴充 `word_timestamps` 選項。
+  2. 目前以 segment 級別時間戳記為主；若 Phase 4 / Phase 6 需要更細緻的單字級高亮，可於 `TranscriptionRequest` 擴充 `word_timestamps` 選項。
   3. 首次下載大型模型若未設定 `HF_TOKEN` 環境變數，Hugging Face Hub 可能顯示匿名限速提示（不影響本機下載與快取運作）。
   4. `large-v3` 在 6 GB VRAM 環境同時開啟其他 GPU 程式時可能觸發記憶體不足，建議優先使用預設 `medium` 或 `small`，必要時改用 `--device cpu`。
+
+### Phase 3 狀態
+- **目前狀態**：已完成（Completed）
+- **完成日期**：2026-11-21
+- **環境與依賴版本**：
+  - Python `3.10.11`（`.venv`）
+  - 複用既有 `ctranslate2 4.9.0`、`tokenizers 0.23.3`、`huggingface_hub 2.4.0`、`PyYAML 6.0.3`（零 PyTorch、零 `llama-cpp-python`）
+  - 本機實測硬體：NVIDIA GeForce GTX 1660 Ti（6 GB VRAM）、16 GB RAM、Windows
+  - 實測翻譯模型：
+    - CT2-NLLB：`JustFrederik/nllb-200-distilled-600M-ct2-int8`（快取於 `models/nllb/`）
+    - Local LLM：外部 Ollama 服務 + `qwen3:4b`（Q4，實測佔用約 3.2 GB VRAM，100% GPU）
+- **實作摘要**：
+  - 建立獨立、解耦之翻譯模組 `src/subtitleui/translator/`（`errors.py`、`models.py`、`config.py`、`selector.py`、`storage.py`、`engine.py` 與 `backends/{base,ct2_nllb,local_llm}.py`），完全不修改 Phase 1 / Phase 2 內部實作。
+  - 建立 `ConfigManager` 與 `config/config.example.yaml`：啟動時自動讀取 `config/config.yaml`（不存在時自動建立預設設定；格式或欄位錯誤時回報明確訊息且絕不覆蓋使用者設定檔），並預留環境變數與安全憑證管理介面（`CredentialStore`）。
+  - 採用可插拔 `TranslationBackend` 雙後端架構：
+    - **CT2-NLLB（`ct2-nllb`）**：免 PyTorch、免 Ollama，支援 `kor_Hang -> zho_Hant`、模型自動下載至 `models/nllb/`、`translate_batch()` 批次翻譯、空白句零錯位保護，以及 CUDA 不可用或推論失敗時自動降級至 `CPU / INT8`。
+    - **Local LLM（`local-llm`）**：透過標準庫 `urllib.request` 呼叫 OpenAI-compatible HTTP API（支援 Ollama、`llama-server`、LM Studio，API 位址與模型完全由設定檔決定），具備逾時重試、連線失敗明確錯誤提示，以及針對 Ollama 推理型模型（如 Qwen3）之 `disable_thinking` 加速支援。
+  - `TranslationEngine` 實作批次與滑動視窗上下文（預設每批 10 句、前後各 2 句，且局部選取時仍會從完整逐字稿取得真實前後文）、嚴格 ID 對齊驗證（漏翻／重複／多出索引／空白譯文偵測）、格式錯誤時自動重新解析 → 縮小批次對半重試 → 單句重試之多層保護、模型載入／卸載與 `before_load_hook` 生命週期管理，以及供未來 GUI 與 Phase 7 呼叫之純記憶體 API（`translate_text()`、`translate_segments()`）。
+  - 擴充 `src/subtitleui/paths.py` 新增 `outputs/translation/`（`<stem>.zh-TW.translation.json`）與設定路徑管理；`storage.py` 以唯讀方式載入 Phase 2 ASR JSON 並建立穩定 0-based 索引，內建安全防護禁止覆寫原始 `.transcript.json`，並以原子寫入支援 `merge`（預設，保留其他已翻譯片段）、`skip_existing`（增量補翻）與 `overwrite`。
+  - 擴充 `src/subtitleui/cli.py` 新增 `translate` 子命令，支援全文、指定句子（`--segments 1,3,5-10`，1-based）、指定時間區間（`--start` / `--end`，採 `segment.end > start and segment.start < end` 交集規則）、`--backend` 切換、即時批次進度、Ctrl+C 取消與摘要預覽。
+- **測試與實測結果**：
+  - 自動化單元測試（`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`）：**74 / 74 項測試全部通過**（含 Phase 1、Phase 2 原有 51 項全數通過，以及 Phase 3 新增 23 項，涵蓋設定檔自動建立與錯誤保護、1-based 選句與時間區間交集、ASR 唯讀保護與局部合併、NLLB 空白句索引保護與 CUDA→CPU 降級、Local LLM 連線錯誤／逾時／404、對齊驗證與縮批單句重試、取消機制與 CLI 測試）。
+  - 真實韓文逐字稿對比實測（`Wait, you guys knew each other？` 37 句 + `Workout With My BF` 21 句 + `korean_full` 3 句）：
+    - **CT2-NLLB（CUDA INT8）**：37 句耗時 `3.41s`、21 句耗時 `2.89s`（CPU INT8 亦實測正常）。對標準敬語句基本可用，但在韓文口語、感嘆詞、俚語與短句上易出現字面直譯或語意偏差（例如 `아니야 방금 굉장히 인위적이었어` → `沒有,我只是非常人性.`、`대박이다` → `這是一場大戰.`、`살 많이 빠졌네` → `沒有任何問題.`）。
+    - **Local LLM（Ollama `qwen3:4b`，`disable_thinking: true`）**：37 句耗時 `32.69s`、21 句耗時 `18.06s`，全部批次 100% 通過索引對齊驗證。在韓文半語、敬語、省略主詞、感嘆詞與上下文口語理解上明顯優於 600M NLLB（例如 `아니야 방금 굉장히 인위적이었어` → `不是啦，剛才實在太刻意了`、`대박이다` → `太棒了！`、`살 많이 빠졌네` → `瘦了好多啊`、`이게 케이스야` → `這是外殼`）。同時也觀察到 4B 量化模型偶有外來語混寫（如 `카메라` 譯成 `卡amera`）或少數俚語語意偏差，證實開放使用者自由更換模型之必要性。
+- **尚未解決問題與注意事項**：
+  1. 若在 Ollama 上使用推理型模型（如 `qwen3:4b`）且關閉 `disable_thinking`（改走思考模式），單批翻譯可能耗時數分鐘；建議字幕翻譯維持預設 `disable_thinking: true`，或選用非思考型／更適合多語翻譯之模型（如 `qwen2.5:7b`、`gemma3` 等，依硬體 VRAM 調整）。
+  2. 6 GB VRAM 環境下同時常駐 Whisper 與大型 Local LLM 易導致記憶體不足，未來 Phase 5 GUI 整合時應透過 `TranscriptionEngine.unload_model()` 與 `TranslationEngine(..., before_load_hook=...)` 避免兩者同時佔用 VRAM。
+  3. 雲端 API Key 安全儲存目前已完成 `CredentialStore` 介面預留與環境變數讀取（`api_key_env`），Windows Credential Manager 實際整合將於有雲端後端需求時補上。
+
 

@@ -24,6 +24,7 @@ htmlcov/
 .env.*
 *.pem
 *.key
+config/config.yaml
 
 # Downloaded media, processed outputs, temporary files, & local models
 downloads/
@@ -32,6 +33,7 @@ temp/
 models/
 transcripts/
 *.transcript.json
+*.translation.json
 
 # Temporary / media files (prevent accidental commits)
 *.mp4

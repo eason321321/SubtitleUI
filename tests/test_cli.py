@@ -24,8 +24,14 @@ from subtitleui.asr import (  # noqa: E402
 )
 from subtitleui.cli import main  # noqa: E402
 from subtitleui.downloader import MediaDownloader  # noqa: E402
+from subtitleui.translator import (  # noqa: E402
+    TranslationConfig,
+    TranslationEngine,
+    load_translation_json,
+)
 from tests.test_asr import FakeWhisperModel, _FakeRawSegment, _make_mock_extractor  # noqa: E402
 from tests.test_downloader import FakeYoutubeDL  # noqa: E402
+from tests.test_translator import _FakeBackend, _write_sample_asr_json  # noqa: E402
 
 
 class TestCLI(unittest.TestCase):
@@ -366,6 +372,114 @@ class TestTranscribeCLI(unittest.TestCase):
                 self.assertEqual(loaded.metadata.range_end, 120.0)
                 self.assertEqual(loaded.segments[0].start, 61.5)
                 self.assertEqual(loaded.segments[0].end, 64.2)
+
+
+class TestTranslateCLI(unittest.TestCase):
+    """Tests for Phase 3 CLI translate subcommand."""
+
+    def test_cli_translate_full_segments_and_time_range_with_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            asr_path = _write_sample_asr_json(Path(tmp) / "clip.transcript.json")
+            cfg_path = Path(tmp) / "config.yaml"
+            out_path = Path(tmp) / "clip.zh-TW.translation.json"
+
+            def fake_tr_factory(cfg: TranslationConfig) -> TranslationEngine:
+                return TranslationEngine(
+                    cfg,
+                    backend=_FakeBackend(name=cfg.provider, model="test-model"),
+                )
+
+            # 1) Translate specific segments 1,3
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            code = main(
+                [
+                    "translate",
+                    str(asr_path),
+                    "--segments",
+                    "1,3",
+                    "--backend",
+                    "local-llm",
+                    "--config",
+                    str(cfg_path),
+                    "-o",
+                    str(out_path),
+                ],
+                translation_engine_factory=fake_tr_factory,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            self.assertEqual(code, 0, stderr.getvalue())
+            self.assertTrue(cfg_path.exists())
+            self.assertIn("翻譯摘要", stdout.getvalue())
+            loaded = load_translation_json(out_path)
+            self.assertEqual([s.index for s in loaded.segments], [0, 2])
+
+            # 2) Translate time range 00:00:15 ~ 00:00:24 and verify merge preserves 0, 2
+            stdout2 = io.StringIO()
+            stderr2 = io.StringIO()
+            code2 = main(
+                [
+                    "translate",
+                    str(asr_path),
+                    "--start",
+                    "00:00:15",
+                    "--end",
+                    "00:00:24",
+                    "--config",
+                    str(cfg_path),
+                    "-o",
+                    str(out_path),
+                ],
+                translation_engine_factory=fake_tr_factory,
+                stdout=stdout2,
+                stderr=stderr2,
+            )
+            self.assertEqual(code2, 0, stderr2.getvalue())
+            loaded2 = load_translation_json(out_path)
+            self.assertEqual([s.index for s in loaded2.segments], [0, 2, 4, 5])
+
+    def test_cli_translate_handles_errors_and_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            asr_path = _write_sample_asr_json(Path(tmp) / "clip.transcript.json")
+            cfg_path = Path(tmp) / "config.yaml"
+
+            def fake_tr_factory(cfg: TranslationConfig) -> TranslationEngine:
+                return TranslationEngine(cfg, backend=_FakeBackend())
+
+            # Cancelled via token
+            token = CancellationToken()
+            token.cancel()
+            stderr_cancel = io.StringIO()
+            code_cancel = main(
+                ["translate", str(asr_path), "--config", str(cfg_path)],
+                translation_engine_factory=fake_tr_factory,
+                cancel_token=token,
+                stdout=io.StringIO(),
+                stderr=stderr_cancel,
+            )
+            self.assertEqual(code_cancel, 130)
+            self.assertIn("翻譯已取消", stderr_cancel.getvalue())
+
+            # Conflicting selectors -> exit 1
+            stderr_err = io.StringIO()
+            code_err = main(
+                [
+                    "translate",
+                    str(asr_path),
+                    "--segments",
+                    "1",
+                    "--start",
+                    "00:00:10",
+                    "--config",
+                    str(cfg_path),
+                ],
+                translation_engine_factory=fake_tr_factory,
+                stdout=io.StringIO(),
+                stderr=stderr_err,
+            )
+            self.assertEqual(code_err, 1)
+            self.assertIn("翻譯失敗", stderr_err.getvalue())
 
 
 if __name__ == "__main__":

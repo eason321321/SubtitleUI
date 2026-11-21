@@ -1,0 +1,60 @@
+# SubtitleUI 翻譯系統設定範本（Phase 3）
+# 程式啟動時若找不到 config/config.yaml，會自動以預設值建立。
+# 請將此檔案複製為 config/config.yaml 後依個人環境修改。
+
+translation:
+  # 預設翻譯後端：
+  # - "ct2-nllb"：本機 CTranslate2 NLLB-200-distilled-600M（不需安裝 Ollama，可離線運作）
+  # - "local-llm"：透過 OpenAI-compatible HTTP API 連線至本機 LLM（Ollama / llama-server / LM Studio）
+  provider: "ct2-nllb"
+
+  # 本機 LLM（外部服務，非必要組件）
+  local_llm:
+    # 僅作標示與錯誤提示參考：ollama / llama-server / lm-studio / openai-compatible
+    backend: "ollama"
+    # OpenAI-compatible API Base URL（請依實際服務位址調整）
+    # Ollama 預設：http://localhost:11434/v1
+    # llama-server 範例：http://localhost:8080/v1
+    # LM Studio 範例：http://localhost:1234/v1
+    base_url: "http://localhost:11434/v1"
+    # 使用模型名稱（可自行替換，不可寫死；請確認外部服務已載入該模型）
+    model: "qwen3:4b"
+    # 注意：請勿將付費或雲端 API Key 明文儲存於一般設定檔。
+    # 本機服務通常不需金鑰（保持空字串即可）；如需金鑰，建議透過下方環境變數名稱讀取，
+    # 未來將透過 credential_key 銜接 Windows Credential Manager 等安全憑證管理機制。
+    api_key: ""
+    api_key_env: ""
+    credential_key: ""
+    # 單次 API 請求逾時秒數（低 VRAM / CPU Offload 情境建議設為 120 秒以上）
+    timeout: 120
+    # 網路暫時性錯誤或逾時之重試次數
+    max_retries: 2
+    # 生成溫度（翻譯任務建議偏低以保持忠實與穩定）
+    temperature: 0.2
+    # 針對支援推理思考模式的模型（如 Qwen3）停用冗長思考輸出以加快字幕翻譯
+    disable_thinking: true
+
+  # CTranslate2 NLLB 基礎翻譯引擎（免 PyTorch）
+  ct2_nllb:
+    # 本機模型快取路徑（相對路徑會以專案根目錄解析）
+    model_path: "./models/nllb"
+    # 本機尚無模型時自動下載之 Hugging Face CTranslate2 量化模型
+    model_repo: "JustFrederik/nllb-200-distilled-600M-ct2-int8"
+    # 運算裝置：auto（優先 CUDA，無法使用時自動降級 CPU INT8）、cuda 或 cpu
+    device: "auto"
+    # CTranslate2 量化精度：int8（建議，低記憶體佔用）、float16、int8_float16、float32
+    compute_type: "int8"
+    # 當 device 設為 cuda 但 CUDA 不可用或推論失敗時，是否自動降級至 CPU INT8
+    fallback_to_cpu: true
+    beam_size: 4
+    max_decoding_length: 256
+    cpu_threads: 0
+
+  # 來源與目標語系
+  source_language: "ko"
+  target_language: "zh-TW"
+
+  # 批次翻譯與滑動視窗上下文設定
+  batch_size: 10
+  context_before: 2
+  context_after: 2
