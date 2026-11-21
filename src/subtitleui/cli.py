@@ -34,6 +34,11 @@ from .downloader import (
     ExistingFilePolicy,
     MediaDownloader,
 )
+from .paths import (
+    DOWNLOAD_DIR,
+    default_transcript_output_path,
+    resolve_media_input_path,
+)
 
 EngineFactory = Callable[[ModelConfig], TranscriptionEngine]
 
@@ -168,7 +173,7 @@ def build_download_parser(*, prog: str = "subtitleui") -> argparse.ArgumentParse
         "-o",
         "--output",
         default=None,
-        help="輸出資料夾路徑，預設為 downloads",
+        help="輸出資料夾路徑，預設為 downloads/",
     )
     parser.add_argument(
         "--audio-format",
@@ -194,7 +199,7 @@ def build_transcribe_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "input_path",
         nargs="?",
-        help="本機音訊或影片檔案路徑（若未提供，將以互動方式提示輸入）",
+        help="本機音訊或影片檔案路徑（預設來源為 downloads/；若未提供，將以互動方式提示輸入）",
     )
     parser.add_argument(
         "--model",
@@ -226,7 +231,7 @@ def build_transcribe_parser() -> argparse.ArgumentParser:
         "-o",
         "--output",
         default=None,
-        help="輸出 JSON 逐字稿路徑（預設為輸入檔案同資料夾之 <檔名>.transcript.json）",
+        help="輸出 JSON 逐字稿路徑（預設為 outputs/transcription/<檔名>.transcript.json）",
     )
     parser.add_argument(
         "--device",
@@ -296,18 +301,20 @@ def _prompt_interactive_download(
     output_str = args.output
     if output_str is None:
         if args.url:
-            output_str = "downloads"
+            output_dir = DOWNLOAD_DIR
         else:
-            stream.write("請輸入輸出資料夾路徑 (預設 downloads): ")
+            stream.write(f"請輸入輸出資料夾路徑 (預設 {DOWNLOAD_DIR}): ")
             stream.flush()
             entered_output = input_func().strip()
-            output_str = entered_output or "downloads"
+            output_dir = Path(entered_output) if entered_output else DOWNLOAD_DIR
+    else:
+        output_dir = Path(output_str)
 
-    return url, mode, Path(output_str)
+    return url, mode, output_dir
 
 
 def _default_transcript_output_path(input_path: Path) -> Path:
-    return input_path.expanduser().resolve().with_suffix(".transcript.json")
+    return default_transcript_output_path(input_path)
 
 
 def _prompt_interactive_transcribe(
@@ -320,11 +327,11 @@ def _prompt_interactive_transcribe(
     raw_input = args.input_path
     interactive = not raw_input
     if not raw_input:
-        stream.write("請輸入音訊或影片檔案路徑: ")
+        stream.write(f"請輸入音訊或影片檔案路徑 (預設來源 {DOWNLOAD_DIR}): ")
         stream.flush()
         raw_input = input_func().strip().strip('"').strip("'")
 
-    input_path = Path(raw_input)
+    input_path = resolve_media_input_path(raw_input) if raw_input else Path(raw_input)
 
     model_name = args.model
     if not model_name:

@@ -37,6 +37,7 @@ from subtitleui.downloader import (  # noqa: E402
 
 
 from subtitleui.downloader.service import VIDEO_MP4_COMPATIBLE_FORMAT  # noqa: E402
+from subtitleui.paths import DOWNLOAD_DIR  # noqa: E402
 
 
 class FakeYoutubeDL:
@@ -310,6 +311,43 @@ class TestMediaDownloader(unittest.TestCase):
             self.assertIn("aac", ffmpeg_cmds[0])
             self.assertEqual(result.file_path.read_bytes(), b"mp4-with-aac-audio")
             self.assertEqual(result.file_size, len(b"mp4-with-aac-audio"))
+
+    def test_default_output_dir_and_temp_dir_isolation_for_mp4_transcode(self) -> None:
+        req = DownloadRequest(url="https://www.youtube.com/watch?v=def001")
+        self.assertEqual(req.output_dir, DOWNLOAD_DIR)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "downloads"
+            temp_dir = Path(tmp) / "temp"
+            ffmpeg_temp_targets: list[Path] = []
+
+            def fake_ffmpeg(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+                target = Path(cmd[-1])
+                ffmpeg_temp_targets.append(target)
+                target.write_bytes(b"transcoded-aac-mp4")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            downloader = MediaDownloader(
+                ydl_factory=lambda opts: FakeYoutubeDL(opts, acodec="opus"),
+                ffmpeg_checker=lambda: "ffmpeg",
+                ffmpeg_runner=fake_ffmpeg,
+                temp_dir=temp_dir,
+            )
+            result = downloader.download(
+                DownloadRequest(
+                    url="https://www.youtube.com/watch?v=opus002",
+                    mode=DownloadMode.VIDEO,
+                    output_dir=out_dir,
+                )
+            )
+            self.assertEqual(len(ffmpeg_temp_targets), 1)
+            # Temp file was created inside temp_dir, not downloads/
+            self.assertEqual(ffmpeg_temp_targets[0].parent.parent, temp_dir.resolve())
+            self.assertFalse(ffmpeg_temp_targets[0].exists())
+            self.assertFalse(ffmpeg_temp_targets[0].parent.exists())
+            self.assertEqual(list(temp_dir.iterdir()), [])
+            self.assertEqual(result.file_path.parent, out_dir.resolve())
+            self.assertEqual(len(list(out_dir.iterdir())), 1)
 
     def test_video_download_fallback_format_without_ffmpeg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

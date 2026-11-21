@@ -5,19 +5,27 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from ..paths import default_transcript_output_path
 from .errors import TranscriptionError
 from .models import TranscriptionResult
 
 
 def save_transcript_json(
     result: TranscriptionResult,
-    output_path: str | Path,
+    output_path: str | Path | None = None,
 ) -> Path:
     """Save a TranscriptionResult to a UTF-8 JSON file.
 
+    When `output_path` is omitted, defaults to
+    `outputs/transcription/<source_stem>.transcript.json`.
     Parent directories are created automatically if they do not exist.
     """
-    target = Path(output_path).expanduser().resolve()
+    resolved_output = (
+        output_path
+        if output_path is not None
+        else default_transcript_output_path(result.metadata.source)
+    )
+    target = Path(resolved_output).expanduser().resolve()
     if target.exists() and target.is_dir():
         raise TranscriptionError(f"輸出 JSON 路徑不可為資料夾：{target}")
 

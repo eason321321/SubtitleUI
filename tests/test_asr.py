@@ -13,6 +13,7 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
+from unittest import mock
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SRC_DIR = ROOT_DIR / "src"
@@ -50,6 +51,9 @@ from subtitleui.asr import (  # noqa: E402
     resolve_time_range,
     save_transcript_json,
 )
+
+
+from subtitleui.paths import TEMP_DIR  # noqa: E402
 
 
 def _create_pcm_wav(
@@ -686,6 +690,17 @@ class TestTranscriptionEngine(unittest.TestCase):
             self.assertEqual(loaded.segments, original.segments)
             self.assertEqual(loaded.output_path, saved)
 
+            # Saving without explicit output_path defaults to outputs/transcription/
+            fake_transcription_dir = Path(tmp) / "outputs" / "transcription"
+            self.assertFalse(fake_transcription_dir.exists())
+            with mock.patch("subtitleui.paths.TRANSCRIPTION_DIR", fake_transcription_dir):
+                default_saved = save_transcript_json(original)
+            self.assertEqual(
+                default_saved,
+                (fake_transcription_dir / "korean.transcript.json").resolve(),
+            )
+            self.assertTrue(default_saved.exists())
+
 
 class TestRealFFmpegAudioExtractor(unittest.TestCase):
     """Integration test verifying real FFprobe/FFmpeg slicing & temp cleanup."""
@@ -719,8 +734,62 @@ class TestRealFFmpegAudioExtractor(unittest.TestCase):
                 self.assertAlmostEqual(extracted.duration, 3.0, delta=0.15)
 
             assert temp_wav_path is not None
+            self.assertEqual(temp_wav_path.parent.parent, TEMP_DIR.resolve())
             self.assertFalse(temp_wav_path.exists())
             self.assertFalse(temp_wav_path.parent.exists())
+
+    def test_real_ffmpeg_default_audio_output_and_custom_temp_auto_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads_dir = Path(tmp) / "downloads"
+            audio_out_dir = Path(tmp) / "outputs" / "audio"
+            temp_dir = Path(tmp) / "temp"
+            source_wav = _create_pcm_wav(
+                downloads_dir / "korean_sample.wav",
+                duration_seconds=4.0,
+                sample_rate=44100,
+                channels=2,
+            )
+            self.assertFalse(audio_out_dir.exists())
+            self.assertFalse(temp_dir.exists())
+
+            extractor = AudioExtractor(
+                temp_dir=temp_dir,
+                audio_output_dir=audio_out_dir,
+                download_dir=downloads_dir,
+            )
+
+            # Resolve by relative filename from downloads_dir
+            duration = extractor.probe_duration("korean_sample.wav")
+            self.assertAlmostEqual(duration, 4.0, delta=0.1)
+
+            # extract_wav with output_wav=None writes to outputs/audio/ and auto-creates it
+            time_range, is_custom = resolve_time_range("00:00:01", "00:00:03", duration)
+            saved_audio = extractor.extract_wav(
+                "korean_sample.wav",
+                time_range=time_range,
+                is_custom_range=is_custom,
+            )
+            self.assertTrue(audio_out_dir.exists())
+            self.assertEqual(saved_audio.wav_path, (audio_out_dir / "korean_sample.wav").resolve())
+            self.assertTrue(saved_audio.wav_path.exists())
+            self.assertEqual(saved_audio.sample_rate, 16000)
+            self.assertEqual(saved_audio.channels, 1)
+
+            # extract_to_temp auto-creates temp_dir and cleans up inside it
+            temp_wav_path: Path | None = None
+            with extractor.extract_to_temp(
+                source_wav,
+                time_range=time_range,
+                is_custom_range=is_custom,
+            ) as extracted:
+                temp_wav_path = extracted.wav_path
+                self.assertTrue(temp_dir.exists())
+                self.assertEqual(temp_wav_path.parent.parent, temp_dir.resolve())
+                self.assertTrue(temp_wav_path.exists())
+
+            assert temp_wav_path is not None
+            self.assertFalse(temp_wav_path.exists())
+            self.assertEqual(list(temp_dir.iterdir()), [])
 
     def test_audio_extractor_missing_ffmpeg_raises_audio_extraction_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

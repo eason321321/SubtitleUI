@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from ..paths import DOWNLOAD_DIR
+
 
 class DownloadMode(str, Enum):
     """Supported download modes."""
@@ -40,7 +42,7 @@ class DownloadRequest:
 
     url: str
     mode: DownloadMode = DownloadMode.VIDEO
-    output_dir: Path = Path("downloads")
+    output_dir: Path = DOWNLOAD_DIR
     existing_file_policy: ExistingFilePolicy = ExistingFilePolicy.SKIP
     audio_format: str = "m4a"
 

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from yt_dlp.utils import DownloadError
 
@@ -279,6 +280,92 @@ class TestTranscribeCLI(unittest.TestCase):
             )
             self.assertEqual(code_cancel, 130)
             self.assertIn("辨識已取消", stderr_cancel.getvalue())
+
+    def test_cli_default_download_and_transcription_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_downloads = Path(tmp) / "downloads"
+            fake_transcriptions = Path(tmp) / "outputs" / "transcription"
+            fake_temp = Path(tmp) / "temp"
+
+            # Directories do not exist yet; both phases must auto-create them.
+            self.assertFalse(fake_downloads.exists())
+            self.assertFalse(fake_transcriptions.exists())
+
+            with (
+                mock.patch("subtitleui.cli.DOWNLOAD_DIR", fake_downloads),
+                mock.patch("subtitleui.paths.DOWNLOAD_DIR", fake_downloads),
+                mock.patch("subtitleui.paths.TRANSCRIPTION_DIR", fake_transcriptions),
+            ):
+                # Phase 1: default download goes into downloads/
+                downloader = MediaDownloader(
+                    ydl_factory=lambda opts: FakeYoutubeDL(
+                        opts,
+                        title="한국어 영상",
+                        media_id="vid999",
+                    ),
+                    ffmpeg_checker=lambda: "ffmpeg",
+                    temp_dir=fake_temp,
+                )
+                dl_out = io.StringIO()
+                dl_err = io.StringIO()
+                dl_code = main(
+                    ["https://www.youtube.com/watch?v=vid999"],
+                    downloader=downloader,
+                    stdout=dl_out,
+                    stderr=dl_err,
+                )
+                self.assertEqual(dl_code, 0, dl_err.getvalue())
+                expected_video = fake_downloads / "한국어 영상 [vid999].mp4"
+                self.assertTrue(expected_video.exists())
+
+                # Phase 2: reads video from downloads/ (by filename) and writes JSON
+                # by default into outputs/transcription/, NOT downloads/
+                def fake_engine_factory(cfg: ModelConfig) -> TranscriptionEngine:
+                    extractor = _make_mock_extractor(source_duration=600.0)
+                    extractor._download_dir = fake_downloads
+                    extractor._temp_dir = fake_temp
+                    return TranscriptionEngine(
+                        cfg,
+                        audio_extractor=extractor,
+                        model_factory=lambda name, **kw: FakeWhisperModel(
+                            segments=[_FakeRawSegment(1.5, 4.2, " 안녕하세요.")]
+                        ),
+                        cuda_checker=lambda: (False, "cpu"),
+                    )
+
+                asr_out = io.StringIO()
+                asr_err = io.StringIO()
+                asr_code = main(
+                    [
+                        "transcribe",
+                        "한국어 영상 [vid999].mp4",
+                        "--start",
+                        "00:01:00",
+                        "--end",
+                        "00:02:00",
+                        "--model-dir",
+                        str(Path(tmp) / "models"),
+                    ],
+                    engine_factory=fake_engine_factory,
+                    stdout=asr_out,
+                    stderr=asr_err,
+                )
+                self.assertEqual(asr_code, 0, asr_err.getvalue())
+
+                expected_json = fake_transcriptions / "한국어 영상 [vid999].transcript.json"
+                self.assertTrue(expected_json.exists())
+                # Ensure NO JSON or temp file was written into downloads/
+                self.assertEqual(
+                    [p.name for p in fake_downloads.iterdir()],
+                    ["한국어 영상 [vid999].mp4"],
+                )
+                # Ensure original video timestamps are preserved
+                loaded = load_transcript_json(expected_json)
+                self.assertEqual(loaded.metadata.source, str(expected_video.resolve()))
+                self.assertEqual(loaded.metadata.range_start, 60.0)
+                self.assertEqual(loaded.metadata.range_end, 120.0)
+                self.assertEqual(loaded.segments[0].start, 61.5)
+                self.assertEqual(loaded.segments[0].end, 64.2)
 
 
 if __name__ == "__main__":

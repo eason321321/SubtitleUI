@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
 
 import yt_dlp
 from yt_dlp.utils import DownloadError, ExtractorError, PostProcessingError
+
+from ..paths import TEMP_DIR, ensure_dir
 
 from .errors import (
     DownloaderError,
@@ -127,10 +130,12 @@ class MediaDownloader:
         ydl_factory: Callable[[dict[str, Any]], Any] | None = None,
         ffmpeg_checker: Callable[[], str | None] | None = None,
         ffmpeg_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+        temp_dir: Path | None = None,
     ) -> None:
         self._ydl_factory = ydl_factory or yt_dlp.YoutubeDL
         self._ffmpeg_checker = ffmpeg_checker or _find_ffmpeg
         self._ffmpeg_runner = ffmpeg_runner or _default_ffmpeg_runner
+        self._temp_dir = temp_dir if temp_dir is not None else TEMP_DIR
 
     def download(
         self,
@@ -435,60 +440,62 @@ class MediaDownloader:
             ),
         )
 
-        temp_output = final_path.with_name(f"{final_path.stem}.aac_tmp{final_path.suffix}")
-        cmd = [
-            ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(final_path),
-            "-map",
-            "0",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-            str(temp_output),
-        ]
-        try:
-            proc = self._ffmpeg_runner(cmd)
-        except OSError as exc:
-            temp_output.unlink(missing_ok=True)
-            err = ExternalToolError(f"執行 FFmpeg 轉碼 MP4 音訊失敗：{exc}")
-            self._emit_progress(
-                progress_callback,
-                DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
-            )
-            raise err from exc
+        temp_base = ensure_dir(self._temp_dir)
+        with tempfile.TemporaryDirectory(
+            prefix="subtitleui_dl_",
+            dir=str(temp_base),
+        ) as tmp_dir:
+            temp_output = Path(tmp_dir) / f"{final_path.stem}.aac_tmp{final_path.suffix}"
+            cmd = [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(final_path),
+                "-map",
+                "0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                str(temp_output),
+            ]
+            try:
+                proc = self._ffmpeg_runner(cmd)
+            except OSError as exc:
+                err = ExternalToolError(f"執行 FFmpeg 轉碼 MP4 音訊失敗：{exc}")
+                self._emit_progress(
+                    progress_callback,
+                    DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
+                )
+                raise err from exc
 
-        if proc.returncode != 0 or not temp_output.exists() or temp_output.stat().st_size == 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            temp_output.unlink(missing_ok=True)
-            err = ExternalToolError(
-                f"FFmpeg 轉碼 MP4 音訊為 AAC 失敗：{detail or f'exit code {proc.returncode}'}"
-            )
-            self._emit_progress(
-                progress_callback,
-                DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
-            )
-            raise err
+            if proc.returncode != 0 or not temp_output.exists() or temp_output.stat().st_size == 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                err = ExternalToolError(
+                    f"FFmpeg 轉碼 MP4 音訊為 AAC 失敗：{detail or f'exit code {proc.returncode}'}"
+                )
+                self._emit_progress(
+                    progress_callback,
+                    DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
+                )
+                raise err
 
-        try:
-            temp_output.replace(final_path)
-        except OSError as exc:
-            temp_output.unlink(missing_ok=True)
-            err = MediaDownloadError(f"更新轉碼後的 MP4 檔案失敗：{exc}")
-            self._emit_progress(
-                progress_callback,
-                DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
-            )
-            raise err from exc
+            try:
+                shutil.move(str(temp_output), str(final_path))
+            except OSError as exc:
+                err = MediaDownloadError(f"更新轉碼後的 MP4 檔案失敗：{exc}")
+                self._emit_progress(
+                    progress_callback,
+                    DownloadProgress(status=DownloadStatus.ERROR, message=str(err)),
+                )
+                raise err from exc
 
     @staticmethod
     def _extract_audio_codec(info: dict[str, Any]) -> str | None:

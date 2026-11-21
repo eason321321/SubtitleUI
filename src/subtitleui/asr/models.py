@@ -8,12 +8,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from ..paths import MODELS_DIR
 from .errors import TranscriptionCancelledError
 
 DEFAULT_MODEL_NAME = "medium"
 DEFAULT_LANGUAGE = "ko"
 DEFAULT_TASK = "transcribe"
-DEFAULT_MODELS_DIR = Path("models")
+DEFAULT_MODELS_DIR = MODELS_DIR
 
 SUPPORTED_MODELS: tuple[str, ...] = (
     "small",

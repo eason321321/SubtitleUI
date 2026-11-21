@@ -352,7 +352,7 @@ class TranscriptionEngine:
                     message=f"正在檢查音訊來源與時間範圍：{Path(request.audio_path).name}",
                 ),
             )
-            source_path = Path(request.audio_path).expanduser().resolve()
+            source_path = self._audio_extractor.resolve_media_path(request.audio_path)
             source_duration = self._audio_extractor.probe_duration(source_path)
             time_range, is_custom_range = resolve_time_range(
                 request.start_time,

@@ -13,6 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from ..paths import (
+    AUDIO_OUTPUT_DIR,
+    DOWNLOAD_DIR,
+    TEMP_DIR,
+    default_audio_output_path,
+    ensure_dir,
+    resolve_media_input_path,
+)
 from .errors import AudioExtractionError, AudioInputError
 from .models import CancellationToken, TimeRange
 
@@ -81,11 +89,26 @@ class AudioExtractor:
         ffprobe_finder: Callable[[], str | None] | None = None,
         runner: CommandRunner | None = None,
         wav_inspector: Callable[[Path], tuple[float, int, int]] | None = None,
+        temp_dir: Path | None = None,
+        audio_output_dir: Path | None = None,
+        download_dir: Path | None = None,
     ) -> None:
         self._ffmpeg_finder = ffmpeg_finder or _find_ffmpeg
         self._ffprobe_finder = ffprobe_finder or _find_ffprobe
         self._runner = runner or _default_runner
         self._wav_inspector = wav_inspector or _read_wav_info
+        self._temp_dir = temp_dir
+        self._audio_output_dir = audio_output_dir
+        self._download_dir = download_dir
+
+    def resolve_media_path(self, media_path: str | Path) -> Path:
+        """Resolve an input media path using downloads/ as the default source folder."""
+        if not media_path or (isinstance(media_path, str) and not media_path.strip()):
+            raise AudioInputError("音訊或影片檔案路徑不可為空白。")
+        return resolve_media_input_path(
+            media_path,
+            download_dir=self._download_dir if self._download_dir is not None else DOWNLOAD_DIR,
+        )
 
     def probe_duration(self, media_path: str | Path) -> float:
         """Verify media file existence, audio stream presence, and total duration."""
@@ -141,7 +164,7 @@ class AudioExtractor:
     def extract_wav(
         self,
         media_path: str | Path,
-        output_wav: Path,
+        output_wav: Path | None = None,
         *,
         time_range: TimeRange,
         is_custom_range: bool,
@@ -151,6 +174,7 @@ class AudioExtractor:
 
         Uses full audio decoding (never stream copy) and accurate seeking so
         time boundaries align cleanly with the requested range.
+        When `output_wav` is omitted, writes to `outputs/audio/<stem>.wav`.
         """
         if cancel_token is not None:
             cancel_token.raise_if_cancelled()
@@ -162,7 +186,19 @@ class AudioExtractor:
                 "找不到 FFmpeg，無法擷取音訊。請先安裝 FFmpeg 並加入系統 PATH。"
             )
 
-        output_wav.parent.mkdir(parents=True, exist_ok=True)
+        target_wav = (
+            Path(output_wav).expanduser().resolve()
+            if output_wav is not None
+            else default_audio_output_path(
+                source,
+                audio_output_dir=(
+                    self._audio_output_dir
+                    if self._audio_output_dir is not None
+                    else AUDIO_OUTPUT_DIR
+                ),
+            )
+        )
+        target_wav.parent.mkdir(parents=True, exist_ok=True)
 
         # Place -ss after -i so FFmpeg decodes to the exact requested timestamp
         # instead of snapping to keyframes or using inaccurate stream copy.
@@ -195,7 +231,7 @@ class AudioExtractor:
                 str(ASR_SAMPLE_RATE),
                 "-c:a",
                 ASR_AUDIO_CODEC,
-                str(output_wav),
+                str(target_wav),
             ]
         )
 
@@ -213,10 +249,10 @@ class AudioExtractor:
                 f"FFmpeg 擷取音訊失敗：{detail or f'exit code {proc.returncode}'}"
             )
 
-        if not output_wav.exists() or output_wav.stat().st_size == 0:
-            raise AudioExtractionError(f"FFmpeg 執行完成但未產生有效的音訊檔案：{output_wav}")
+        if not target_wav.exists() or target_wav.stat().st_size == 0:
+            raise AudioExtractionError(f"FFmpeg 執行完成但未產生有效的音訊檔案：{target_wav}")
 
-        actual_duration, sample_rate, channels = self._wav_inspector(output_wav)
+        actual_duration, sample_rate, channels = self._wav_inspector(target_wav)
         if actual_duration <= 0:
             raise AudioExtractionError("擷取後的音訊長度為 0 秒，無法進行語音辨識。")
 
@@ -228,7 +264,7 @@ class AudioExtractor:
             )
 
         return ExtractedAudio(
-            wav_path=output_wav,
+            wav_path=target_wav,
             duration=actual_duration,
             sample_rate=sample_rate,
             channels=channels,
@@ -243,8 +279,14 @@ class AudioExtractor:
         is_custom_range: bool,
         cancel_token: CancellationToken | None = None,
     ) -> Iterator[ExtractedAudio]:
-        """Extract audio into an auto-cleaned temporary directory."""
-        with tempfile.TemporaryDirectory(prefix="subtitleui_asr_") as tmp_dir:
+        """Extract audio into an auto-cleaned temporary directory under temp/."""
+        temp_base = ensure_dir(
+            self._temp_dir if self._temp_dir is not None else TEMP_DIR
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="subtitleui_asr_",
+            dir=str(temp_base),
+        ) as tmp_dir:
             wav_path = Path(tmp_dir) / "segment_16k_mono.wav"
             extracted = self.extract_wav(
                 media_path,
@@ -255,11 +297,8 @@ class AudioExtractor:
             )
             yield extracted
 
-    @staticmethod
-    def _validate_media_path(media_path: str | Path) -> Path:
-        if not media_path or (isinstance(media_path, str) and not media_path.strip()):
-            raise AudioInputError("音訊或影片檔案路徑不可為空白。")
-        path = Path(media_path).expanduser().resolve()
+    def _validate_media_path(self, media_path: str | Path) -> Path:
+        path = self.resolve_media_path(media_path)
         if not path.exists():
             raise AudioInputError(f"找不到音訊或影片檔案：{path}")
         if not path.is_file():
